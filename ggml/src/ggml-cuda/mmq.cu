@@ -287,6 +287,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11) {
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        // P100 (Pascal, cc=600) lacks both fp16 MMA and dp4a hardware instructions.
+        // dp4a is emulated in software, which is slower than cuBLAS FP16 HGEMM.
+        // P100's FP16 throughput is 2x FP32, so prefer cuBLAS over software-emulated dp4a.
+        if (cc == GGML_CUDA_CC_PASCAL) {
+            return false; // Prefer cuBLAS FP16 HGEMM over software-emulated dp4a
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 
