@@ -5,7 +5,6 @@
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
 
-// TODO optimize kernel parameters for FP16 NVIDIA (P100)
 // TODO optimize kernel parameters for head sizes 40, 72, 80, 96, 112
 
 // The ROCm compiler cannot handle templating in __launch_bounds__.
@@ -123,6 +122,63 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  32,  64)
+
+    return 0;
+}
+
+// P100-specific configuration (compute capability 6.0)
+// P100 has 64KB shared memory per SM (vs Volta's 96KB) and no Tensor Cores
+// Uses FP16 path (2x FP32 throughput) but with reduced nbatch_fa to fit in smaller shared memory
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_p100(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2,  64, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  4, 128, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  8, 256, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40, 16, 256, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40, 32, 256, 2,  48,  40)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  2,  64, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  4, 128, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  8, 256, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64, 16, 256, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64, 32, 256, 2,  48,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 72,  72,  2,  64, 2,  48,  72)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 72,  72,  4, 128, 2,  48,  72)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 72,  72,  8, 256, 2,  48,  72)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 72,  72, 16, 256, 2,  48,  72)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 72,  72, 32, 256, 2,  48,  72)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80,  2,  64, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80,  4, 128, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80,  8, 256, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80, 16, 256, 2,  48,  40)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80, 32, 256, 2,  48,  40)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  2,  64, 2,  48,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  4, 128, 2,  48,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  8, 256, 2,  48,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 16, 256, 2,  48,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 32, 256, 2,  48,  48)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112,  2,  64, 2,  48,  56)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112,  4, 128, 2,  48,  56)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112,  8, 256, 2,  48,  56)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 16, 256, 2,  48,  56)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 32, 256, 2,  48,  56)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 256, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 2,  48,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  48,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  48,  64)
+
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  48,  64)
 
     return 0;
 }
@@ -258,6 +314,10 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
         }
         return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
     }
+    // P100 (cc 600) uses special config optimized for 64KB shared memory
+    if (cc == GGML_CUDA_CC_PASCAL) {
+        return ggml_cuda_fattn_tile_get_config_nvidia_p100(DKQ, DV, ncols);
+    }
     if (fast_fp16_available(cc)) {
         return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
     }
@@ -272,11 +332,14 @@ static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int D
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
 #endif // RDNA
 #else
-#ifdef FAST_FP16_AVAILABLE
+// P100 (cc 600) uses special config optimized for 64KB shared memory
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    return ggml_cuda_fattn_tile_get_config_nvidia_p100(DKQ, DV, ncols);
+#elif defined(FAST_FP16_AVAILABLE)
     return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
 #else
     return ggml_cuda_fattn_tile_get_config_nvidia_fp32(DKQ, DV, ncols);
-#endif // FAST_FP16_AVAILABLE
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 #endif // GGML_USE_HIP
 }
 
