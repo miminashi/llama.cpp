@@ -9,7 +9,8 @@
 
 using namespace ggml_cuda_mma;
 
-#define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
+#define MMQ_DP4A_MAX_BATCH_SIZE    64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
+#define MMQ_P100_MAX_BATCH_SIZE     8 // Max. batch size for P100 (emulated dp4a, fast FP16).
 #define MMQ_ITER_K 256
 #define MMQ_NWARPS 8
 

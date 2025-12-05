@@ -278,6 +278,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11) {
         return true;
     }
 
+    // P100 (cc=600) has NO dp4a hardware - it's emulated with 4 muls + 3 adds.
+    // P100 has fast FP16 (2x FP32 throughput), so prefer cuBLAS HGEMM for larger batches.
+    // Must check this BEFORE the compiled arch check below, since P100 has emulated dp4a support.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_PASCAL) {
+        return ne11 < MMQ_P100_MAX_BATCH_SIZE;
+    }
+
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
         return false;
     }
