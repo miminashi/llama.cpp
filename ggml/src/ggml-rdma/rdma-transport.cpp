@@ -510,8 +510,12 @@ bool rdma_connection::rdma_write(const void * local_data, size_t size, struct ib
     std::lock_guard<std::mutex> lock(send_mutex_);
 
     if (!connected_ || !qp_) {
+        GGML_LOG_ERROR("[rdma_connection] rdma_write: not connected\n");
         return false;
     }
+
+    RDMA_LOG_DBG("[rdma_connection] rdma_write: local=%p, size=%zu, lkey=0x%x, remote_addr=0x%lx, rkey=0x%x\n",
+                 local_data, size, local_mr->lkey, (unsigned long)remote.addr, remote.rkey);
 
     struct ibv_sge sge = {};
     sge.addr = (uint64_t)local_data;
@@ -529,21 +533,23 @@ bool rdma_connection::rdma_write(const void * local_data, size_t size, struct ib
         wr.send_flags = IBV_SEND_SIGNALED;
     }
 
-    if (ibv_post_send(qp_, &wr, &bad_wr) != 0) {
-        GGML_LOG_ERROR("[rdma_connection] Failed to post RDMA write: %s\n", strerror(errno));
+    int ret = ibv_post_send(qp_, &wr, &bad_wr);
+    if (ret != 0) {
+        GGML_LOG_ERROR("[rdma_connection] Failed to post RDMA write: %s (ret=%d)\n", strerror(errno), ret);
         return false;
     }
 
     if (signaled) {
         if (!wait_for_completion(30000)) {
-            GGML_LOG_ERROR("[rdma_connection] RDMA write completion timeout\n");
+            GGML_LOG_ERROR("[rdma_connection] RDMA write completion timeout: size=%zu, remote_addr=0x%lx, rkey=0x%x\n",
+                           size, (unsigned long)remote.addr, remote.rkey);
             return false;
         }
     }
 
     stats_.bytes_sent += size;
     stats_.rdma_writes++;
-    RDMA_LOG_DBG("[rdma_connection] RDMA write: %zu bytes to remote 0x%lx\n", size, remote.addr);
+    RDMA_LOG_DBG("[rdma_connection] RDMA write done: %zu bytes to remote 0x%lx\n", size, (unsigned long)remote.addr);
     return true;
 }
 
@@ -626,9 +632,11 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
         int n = ibv_poll_cq(cq_, 1, &wc);
         if (n > 0) {
             if (wc.status != IBV_WC_SUCCESS) {
-                GGML_LOG_ERROR("[rdma_connection] Work completion error: %s\n", ibv_wc_status_str(wc.status));
+                GGML_LOG_ERROR("[rdma_connection] Work completion error: status=%s, opcode=%d, vendor_err=0x%x\n",
+                               ibv_wc_status_str(wc.status), wc.opcode, wc.vendor_err);
                 return false;
             }
+            RDMA_LOG_DBG("[rdma_connection] CQ completion: opcode=%d, bytes=%u\n", wc.opcode, wc.byte_len);
             return true;
         }
         if (n < 0) {
@@ -639,6 +647,7 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (elapsed > timeout_ms) {
+                GGML_LOG_ERROR("[rdma_connection] Completion timeout after %d ms\n", timeout_ms);
                 return false;
             }
         }

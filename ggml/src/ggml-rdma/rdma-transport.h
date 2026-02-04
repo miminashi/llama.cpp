@@ -137,6 +137,13 @@ private:
     rdma_config             config_;
     rdma_stats              stats_;
     std::mutex              send_mutex_;
+
+public:
+    // Operation mutex: protects send+recv command sequences from interleaving
+    // Must be held by callers doing multi-step operations (send header + send data + recv response)
+    // Uses recursive_mutex so that compound operations (e.g., RDMA Write + FLUSH_STAGING)
+    // can call send_rdma_cmd while already holding the lock.
+    std::recursive_mutex    op_mutex_;
     std::mutex              poll_mutex_;
 };
 

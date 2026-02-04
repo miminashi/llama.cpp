@@ -20,13 +20,109 @@
 #include <unordered_set>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <atomic>
 
 using namespace ggml_rdma;
 
 static const char * RDMA_DEBUG = std::getenv("GGML_RDMA_DEBUG");
+static const char * RDMA_PROFILE = std::getenv("GGML_RDMA_PROFILE");
 
 #define RDMA_LOG_DBG(...) \
     do { if (RDMA_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+
+// Profiling infrastructure
+struct rdma_profile_stats {
+    std::atomic<uint64_t> set_tensor_calls{0};
+    std::atomic<uint64_t> set_tensor_bytes{0};
+    std::atomic<uint64_t> set_tensor_us{0};       // total microseconds
+    std::atomic<uint64_t> set_tensor_rdma_calls{0}; // RDMA Write path used
+    std::atomic<uint64_t> set_tensor_send_calls{0}; // Send/Recv fallback used
+
+    std::atomic<uint64_t> get_tensor_calls{0};
+    std::atomic<uint64_t> get_tensor_bytes{0};
+    std::atomic<uint64_t> get_tensor_us{0};
+    std::atomic<uint64_t> get_tensor_rdma_calls{0};
+    std::atomic<uint64_t> get_tensor_send_calls{0};
+
+    std::atomic<uint64_t> graph_compute_calls{0};
+    std::atomic<uint64_t> graph_compute_us{0};
+    std::atomic<uint64_t> graph_compute_full{0};   // full graph sends
+    std::atomic<uint64_t> graph_compute_update{0}; // delta updates
+    std::atomic<uint64_t> graph_compute_recompute{0}; // pure recomputes
+
+    std::atomic<uint64_t> total_token_count{0};
+
+    void print_summary() const {
+        fprintf(stderr, "\n=== RDMA Profile Summary ===\n");
+
+        if (set_tensor_calls > 0) {
+            double avg_us = (double)set_tensor_us.load() / set_tensor_calls.load();
+            double throughput_mbps = set_tensor_bytes > 0 && set_tensor_us > 0
+                ? (double)set_tensor_bytes.load() / set_tensor_us.load()  // bytes/us = MB/s
+                : 0.0;
+            fprintf(stderr, "  set_tensor:  calls=%lu, bytes=%lu (%.1f MB), total=%.1f ms, avg=%.1f us, %.1f MB/s\n",
+                          (unsigned long)set_tensor_calls.load(),
+                          (unsigned long)set_tensor_bytes.load(),
+                          (double)set_tensor_bytes.load() / (1024.0*1024.0),
+                          (double)set_tensor_us.load() / 1000.0,
+                          avg_us, throughput_mbps);
+            fprintf(stderr, "    path: RDMA Write=%lu, Send/Recv=%lu\n",
+                          (unsigned long)set_tensor_rdma_calls.load(),
+                          (unsigned long)set_tensor_send_calls.load());
+        }
+
+        if (get_tensor_calls > 0) {
+            double avg_us = (double)get_tensor_us.load() / get_tensor_calls.load();
+            double throughput_mbps = get_tensor_bytes > 0 && get_tensor_us > 0
+                ? (double)get_tensor_bytes.load() / get_tensor_us.load()
+                : 0.0;
+            fprintf(stderr, "  get_tensor:  calls=%lu, bytes=%lu (%.1f MB), total=%.1f ms, avg=%.1f us, %.1f MB/s\n",
+                          (unsigned long)get_tensor_calls.load(),
+                          (unsigned long)get_tensor_bytes.load(),
+                          (double)get_tensor_bytes.load() / (1024.0*1024.0),
+                          (double)get_tensor_us.load() / 1000.0,
+                          avg_us, throughput_mbps);
+            fprintf(stderr, "    path: RDMA Read=%lu, Send/Recv=%lu\n",
+                          (unsigned long)get_tensor_rdma_calls.load(),
+                          (unsigned long)get_tensor_send_calls.load());
+        }
+
+        if (graph_compute_calls > 0) {
+            double avg_ms = (double)graph_compute_us.load() / graph_compute_calls.load() / 1000.0;
+            fprintf(stderr, "  graph_compute: calls=%lu, total=%.1f ms, avg=%.1f ms\n",
+                          (unsigned long)graph_compute_calls.load(),
+                          (double)graph_compute_us.load() / 1000.0,
+                          avg_ms);
+            fprintf(stderr, "    type: full=%lu, update=%lu, recompute=%lu\n",
+                          (unsigned long)graph_compute_full.load(),
+                          (unsigned long)graph_compute_update.load(),
+                          (unsigned long)graph_compute_recompute.load());
+        }
+
+        double total_rdma_ms = (double)(set_tensor_us.load() + get_tensor_us.load() + graph_compute_us.load()) / 1000.0;
+        fprintf(stderr, "  total RDMA time: %.1f ms\n", total_rdma_ms);
+        fprintf(stderr, "===========================\n\n");
+    }
+
+    void reset() {
+        set_tensor_calls = 0; set_tensor_bytes = 0; set_tensor_us = 0;
+        set_tensor_rdma_calls = 0; set_tensor_send_calls = 0;
+        get_tensor_calls = 0; get_tensor_bytes = 0; get_tensor_us = 0;
+        get_tensor_rdma_calls = 0; get_tensor_send_calls = 0;
+        graph_compute_calls = 0; graph_compute_us = 0;
+        graph_compute_full = 0; graph_compute_update = 0; graph_compute_recompute = 0;
+        total_token_count = 0;
+    }
+};
+
+static rdma_profile_stats g_profile;
+static std::atomic<uint64_t> g_profile_print_interval{10}; // print every N graph_compute calls
+
+static inline uint64_t profile_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // Ensure response is valid
 #define RDMA_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RDMA server crashed or returned malformed response")
@@ -87,6 +183,8 @@ enum rdma_cmd : uint8_t {
     RDMA_CMD_RDMA_WRITE_DONE,  // Notify completion of RDMA write
     RDMA_CMD_RDMA_READ_DONE,   // Notify completion of RDMA read
     RDMA_CMD_GRAPH_COMPUTE_UPDATE,  // Graph compute with delta updates
+    RDMA_CMD_FLUSH_STAGING,    // Flush host staging buffer to GPU (single buffer, specific region)
+    RDMA_CMD_FLUSH_ALL_STAGING, // Flush all dirty staging buffers to GPU (batch flush before graph_compute)
     RDMA_CMD_COUNT,
 };
 
@@ -221,6 +319,57 @@ struct rdma_msg_get_mr_info_rsp {
     uint32_t mr_rkey;
     uint64_t size;
 };
+
+// Flush staging buffer to GPU: client sends this after RDMA Write to host staging
+struct rdma_msg_flush_staging_req {
+    uint64_t remote_ptr;   // Buffer pointer (identifies which buffer's staging to flush)
+    uint64_t offset;       // Offset within the buffer
+    uint64_t size;         // Size of data to flush
+};
+
+// Batch flush staging entry (for FLUSH_ALL_STAGING command)
+struct rdma_msg_flush_entry {
+    uint64_t remote_ptr;   // Buffer pointer
+    uint64_t offset;       // Offset within the buffer
+    uint64_t size;         // Size of data to flush
+};
+
+// Pending flush list: tracks dirty staging regions written via RDMA Write
+// Flushed in batch before graph_compute via FLUSH_ALL_STAGING command
+// Merges ranges per buffer on the client side to minimize wire data
+struct pending_flush_list {
+    // Per-buffer bounding box: min offset and max end
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> dirty_buffers;
+    std::mutex mutex;
+
+    void add(uint64_t remote_ptr, uint64_t offset, uint64_t size) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = dirty_buffers.find(remote_ptr);
+        if (it == dirty_buffers.end()) {
+            dirty_buffers[remote_ptr] = {offset, offset + size};
+        } else {
+            it->second.first = std::min(it->second.first, offset);
+            it->second.second = std::max(it->second.second, offset + size);
+        }
+    }
+
+    std::vector<rdma_msg_flush_entry> drain() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<rdma_msg_flush_entry> result;
+        result.reserve(dirty_buffers.size());
+        for (auto & [ptr, range] : dirty_buffers) {
+            result.push_back({ptr, range.first, range.second - range.first});
+        }
+        dirty_buffers.clear();
+        return result;
+    }
+
+    bool empty() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return dirty_buffers.empty();
+    }
+};
+static pending_flush_list g_pending_flushes;
 
 #pragma pack(pop)
 
@@ -469,8 +618,12 @@ static bool send_rdma_cmd_raw(rdma_connection * conn, rdma_cmd cmd, const void *
 }
 
 // Send command with no response data expected (server still sends rsp_size=0)
+// Thread-safe: protects the entire send+recv sequence with op_mutex_
 static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * input, size_t input_size,
                           struct ibv_mr * send_mr) {
+    std::lock_guard<std::recursive_mutex> op_lock(conn->op_mutex_);
+    RDMA_LOG_DBG("[send_rdma_cmd] cmd=%d, input_size=%zu (locked)\n", (int)cmd, input_size);
+
     if (!send_rdma_cmd_raw(conn, cmd, input, input_size, send_mr)) {
         return false;
     }
@@ -534,9 +687,13 @@ static bool recv_rdma_rsp(rdma_connection * conn, void * output, size_t output_s
     return true;
 }
 
+// Thread-safe: protects the entire send+recv sequence with op_mutex_
 static bool send_rdma_cmd_with_rsp(rdma_connection * conn, rdma_cmd cmd,
                                     const void * input, size_t input_size,
                                     void * output, size_t output_size) {
+    std::lock_guard<std::recursive_mutex> op_lock(conn->op_mutex_);
+    RDMA_LOG_DBG("[send_rdma_cmd_with_rsp] cmd=%d, input_size=%zu, output_size=%zu (locked)\n", (int)cmd, input_size, output_size);
+
     if (!send_rdma_cmd_raw(conn, cmd, input, input_size, nullptr)) {
         return false;
     }
@@ -649,6 +806,7 @@ static enum ggml_status ggml_backend_rdma_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
                                                  const void * data, size_t offset, size_t size) {
+    uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
     ggml_backend_rdma_buffer_context * ctx = (ggml_backend_rdma_buffer_context *)buffer->context;
 
     // Ensure base_ptr is initialized
@@ -663,15 +821,32 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         if (buf) {
             memcpy(buf, data, size);
 
+            // Calculate offset within the buffer
+            uint64_t buf_offset = (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
+
             remote_memory_info remote;
-            remote.addr = ctx->mr_addr + (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
+            remote.addr = ctx->mr_addr + buf_offset;
             remote.rkey = ctx->mr_rkey;
             remote.size = size;
 
-            RDMA_LOG_DBG("[rdma_set_tensor] About to RDMA write: remote.addr=0x%lx, base_ptr=%p, tensor->data=%p\n",
-                         remote.addr, ctx->base_ptr, tensor->data);
+            // Lock op_mutex_ to protect the RDMA Write as an atomic operation
+            std::lock_guard<std::recursive_mutex> op_lock(ctx->conn->op_mutex_);
+
+            RDMA_LOG_DBG("[rdma_set_tensor] About to RDMA write: remote.addr=0x%lx, base_ptr=%p, tensor->data=%p, size=%zu\n",
+                         remote.addr, ctx->base_ptr, tensor->data, size);
             if (ctx->conn->rdma_write(buf, size, mr, remote, true)) {
                 RDMA_LOG_DBG("[rdma_set_tensor] RDMA write succeeded\n");
+
+                // Record dirty region for batch flush before graph_compute
+                g_pending_flushes.add(ctx->remote_ptr, buf_offset, size);
+
+                if (RDMA_PROFILE) {
+                    uint64_t elapsed = profile_now_us() - t0;
+                    g_profile.set_tensor_calls++;
+                    g_profile.set_tensor_bytes += size;
+                    g_profile.set_tensor_us += elapsed;
+                    g_profile.set_tensor_rdma_calls++;
+                }
                 return;
             }
             RDMA_LOG_DBG("[rdma_set_tensor] RDMA write failed, falling back\n");
@@ -688,10 +863,19 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_SET_TENSOR, input.data(), input.size(), nullptr);
     RDMA_STATUS_ASSERT(status);
+
+    if (RDMA_PROFILE) {
+        uint64_t elapsed = profile_now_us() - t0;
+        g_profile.set_tensor_calls++;
+        g_profile.set_tensor_bytes += size;
+        g_profile.set_tensor_us += elapsed;
+        g_profile.set_tensor_send_calls++;
+    }
 }
 
 static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
                                                  void * data, size_t offset, size_t size) {
+    uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
     ggml_backend_rdma_buffer_context * ctx = (ggml_backend_rdma_buffer_context *)buffer->context;
 
     // Ensure base_ptr is initialized
@@ -700,6 +884,9 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 
     // Try RDMA read if we have MR info, staging buffer, and base_ptr is valid
+    // Note: When using host staging (no GDR), RDMA Read reads from the staging buffer
+    // which may not have the latest GPU data (only set_tensor data is there).
+    // For GDR, this reads directly from GPU memory.
     if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr) {
         struct ibv_mr * mr = nullptr;
         void * buf = ctx->staging->get_buffer(size, &mr);
@@ -709,9 +896,19 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             remote.rkey = ctx->mr_rkey;
             remote.size = size;
 
+            // Lock op_mutex_ to protect RDMA Read as an atomic operation
+            std::lock_guard<std::recursive_mutex> op_lock(ctx->conn->op_mutex_);
+
             if (ctx->conn->rdma_read(buf, size, mr, remote, true)) {
                 memcpy(data, buf, size);
                 RDMA_LOG_DBG("[rdma] RDMA read: %zu bytes from tensor %s\n", size, tensor->name);
+                if (RDMA_PROFILE) {
+                    uint64_t elapsed = profile_now_us() - t0;
+                    g_profile.get_tensor_calls++;
+                    g_profile.get_tensor_bytes += size;
+                    g_profile.get_tensor_us += elapsed;
+                    g_profile.get_tensor_rdma_calls++;
+                }
                 return;
             }
         }
@@ -725,6 +922,14 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     bool status = send_rdma_cmd_with_rsp(ctx->conn.get(), RDMA_CMD_GET_TENSOR,
                                           &request, sizeof(request), data, size);
     RDMA_STATUS_ASSERT(status);
+
+    if (RDMA_PROFILE) {
+        uint64_t elapsed = profile_now_us() - t0;
+        g_profile.get_tensor_calls++;
+        g_profile.get_tensor_bytes += size;
+        g_profile.get_tensor_us += elapsed;
+        g_profile.get_tensor_send_calls++;
+    }
 }
 
 static bool ggml_backend_rdma_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -1005,9 +1210,19 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
 }
 
 static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
     ggml_backend_rdma_context * ctx = (ggml_backend_rdma_context *)backend->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+
+    // Flush all dirty staging buffers to GPU before compute
+    // Sends accumulated dirty ranges from set_tensor RDMA Writes
+    auto pending = g_pending_flushes.drain();
+    if (!pending.empty()) {
+        bool flush_ok = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_ALL_STAGING,
+                                       pending.data(), pending.size() * sizeof(rdma_msg_flush_entry), nullptr);
+        RDMA_STATUS_ASSERT(flush_ok);
+    }
 
     bool reuse = ctx->gc.is_cached(cgraph);
     if (reuse) {
@@ -1022,6 +1237,7 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             request.device = ctx->device;
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr);
             RDMA_STATUS_ASSERT(status);
+            if (RDMA_PROFILE) g_profile.graph_compute_recompute++;
         } else {
             // Send delta updates only
             // Wire format: | device(4B) | n_updates(4B) | rdma_tensor_update × n_updates |
@@ -1041,6 +1257,7 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE_UPDATE,
                                         input.data(), input.size(), nullptr);
             RDMA_STATUS_ASSERT(status);
+            if (RDMA_PROFILE) g_profile.graph_compute_update++;
         }
 
         // Update snapshots for next diff
@@ -1057,6 +1274,20 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         // Save snapshots for future diffs
         ctx->gc.build_snapshot_map(cgraph);
         ctx->gc.add(cgraph);
+        if (RDMA_PROFILE) g_profile.graph_compute_full++;
+    }
+
+    if (RDMA_PROFILE) {
+        uint64_t elapsed = profile_now_us() - t0;
+        g_profile.graph_compute_calls++;
+        g_profile.graph_compute_us += elapsed;
+
+        // Periodically print profile summary
+        uint64_t calls = g_profile.graph_compute_calls.load();
+        uint64_t interval = g_profile_print_interval.load();
+        if (interval > 0 && calls % interval == 0) {
+            g_profile.print_summary();
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1543,6 +1774,17 @@ public:
     }
 
     ~rdma_server() {
+        // Free staging buffers first (they reference buffer pointers)
+        for (auto & [buf, info] : staging_buffers_) {
+            if (info.mr) ibv_dereg_mr(info.mr);
+#ifdef GGML_RDMA_CUDA
+            if (info.host_ptr) cudaFreeHost(info.host_ptr);
+#else
+            if (info.host_ptr) ::free(info.host_ptr);
+#endif
+        }
+        staging_buffers_.clear();
+
         for (auto buffer : buffers_) {
             ggml_backend_buffer_free(buffer);
         }
@@ -1574,8 +1816,8 @@ public:
             buffers_.insert(buffer);
             buffer_device_map_[buffer] = dev_id;
 
-            // Register buffer for RDMA access (only when GDR is available)
             if (gdr_memory_manager::is_available()) {
+                // GDR available: register GPU buffer directly for RDMA access
                 void * base = ggml_backend_buffer_get_base(buffer);
                 int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
                 struct ibv_mr * mr = conn->register_memory(base, buffer->size, access_flags);
@@ -1584,8 +1826,11 @@ public:
                     response.mr_addr = (uint64_t)mr->addr;
                     response.mr_rkey = mr->rkey;
                 }
-            } else {
-                RDMA_LOG_DBG("[server] Skipping MR registration (GDR disabled)\n");
+            } else if (!std::getenv("GGML_RDMA_NO_STAGING")) {
+                // No GDR: allocate host staging buffer and register it for RDMA Write
+                // Client will RDMA Write to this staging area, then send FLUSH_STAGING
+                // to trigger cudaMemcpy from staging to GPU buffer
+                alloc_host_staging(buffer, buffer->size, conn, response);
             }
 
             void * base = ggml_backend_buffer_get_base(buffer);
@@ -1606,6 +1851,9 @@ public:
             conn->deregister_memory(mr_it->second);
             buffer_mrs_.erase(mr_it);
         }
+
+        // Free host staging buffer if present
+        free_host_staging(buffer);
 
         ggml_backend_buffer_free(buffer);
         buffers_.erase(buffer);
@@ -1965,6 +2213,109 @@ public:
         return true;
     }
 
+    // Flush host staging buffer to GPU buffer via cudaMemcpy
+    bool flush_staging(const rdma_msg_flush_staging_req & request) {
+        ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+        if (buffers_.find(buffer) == buffers_.end()) {
+            GGML_LOG_ERROR("[rdma_server] flush_staging: buffer %p not found\n", (void*)buffer);
+            return false;
+        }
+
+        auto it = staging_buffers_.find(buffer);
+        if (it == staging_buffers_.end()) {
+            // No staging buffer — GDR path wrote directly to GPU, no flush needed
+            RDMA_LOG_DBG("[rdma_server] flush_staging: no staging (GDR direct), skip\n");
+            return true;
+        }
+
+        host_staging_info & staging = it->second;
+
+        if (request.offset + request.size > staging.size) {
+            GGML_LOG_ERROR("[rdma_server] flush_staging: offset+size exceeds buffer (offset=%" PRIu64 ", size=%" PRIu64 ", buf_size=%zu)\n",
+                           request.offset, request.size, staging.size);
+            return false;
+        }
+
+#ifdef GGML_RDMA_CUDA
+        void * gpu_base = ggml_backend_buffer_get_base(buffer);
+        void * src = static_cast<uint8_t *>(staging.host_ptr) + request.offset;
+        void * dst = static_cast<uint8_t *>(gpu_base) + request.offset;
+
+        uint32_t dev_id = buffer_device_map_[buffer];
+        cudaSetDevice(dev_id);
+        cudaError_t err = cudaMemcpy(dst, src, request.size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            GGML_LOG_ERROR("[rdma_server] flush_staging: cudaMemcpy failed: %s\n", cudaGetErrorString(err));
+            return false;
+        }
+        RDMA_LOG_DBG("[rdma_server] flush_staging: copied %" PRIu64 " bytes at offset %" PRIu64 " to GPU dev %u\n",
+                     request.size, request.offset, dev_id);
+#else
+        // Non-CUDA: staging buffer IS the buffer (host memory), no copy needed
+        (void)request;
+        RDMA_LOG_DBG("[rdma_server] flush_staging: no-op (non-CUDA)\n");
+#endif
+        return true;
+    }
+
+    // Flush specific dirty ranges from staging buffers to GPU
+    // Called before graph_compute with the list of regions written via RDMA Write
+    // Merges overlapping/adjacent ranges per buffer to minimize cudaMemcpy calls
+    bool flush_all_staging(const std::vector<uint8_t> & data) {
+#ifdef GGML_RDMA_CUDA
+        size_t n_entries = data.size() / sizeof(rdma_msg_flush_entry);
+        const rdma_msg_flush_entry * entries = reinterpret_cast<const rdma_msg_flush_entry *>(data.data());
+
+        // Group ranges by buffer and compute bounding box (min_offset, max_end)
+        struct buffer_range {
+            uint64_t min_offset = UINT64_MAX;
+            uint64_t max_end = 0;
+        };
+        std::unordered_map<uint64_t, buffer_range> merged;
+
+        for (size_t i = 0; i < n_entries; i++) {
+            const rdma_msg_flush_entry & entry = entries[i];
+            auto & r = merged[entry.remote_ptr];
+            r.min_offset = std::min(r.min_offset, entry.offset);
+            r.max_end = std::max(r.max_end, entry.offset + entry.size);
+        }
+
+        size_t n_copies = 0;
+        for (auto & [ptr, range] : merged) {
+            ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(ptr);
+
+            auto sit = staging_buffers_.find(buffer);
+            if (sit == staging_buffers_.end()) continue;
+            if (buffers_.find(buffer) == buffers_.end()) continue;
+
+            host_staging_info & staging = sit->second;
+            if (range.max_end > staging.size) {
+                GGML_LOG_ERROR("[rdma_server] flush_all_staging: range exceeds buffer (end=%lu, size=%zu)\n",
+                               (unsigned long)range.max_end, staging.size);
+                range.max_end = staging.size;
+            }
+
+            size_t copy_size = range.max_end - range.min_offset;
+            void * gpu_base = ggml_backend_buffer_get_base(buffer);
+            uint32_t dev_id = buffer_device_map_[buffer];
+            cudaSetDevice(dev_id);
+            void * src = static_cast<uint8_t *>(staging.host_ptr) + range.min_offset;
+            void * dst = static_cast<uint8_t *>(gpu_base) + range.min_offset;
+            cudaError_t err = cudaMemcpy(dst, src, copy_size, cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] flush_all_staging: cudaMemcpy failed: %s\n",
+                               cudaGetErrorString(err));
+                return false;
+            }
+            n_copies++;
+        }
+        RDMA_LOG_DBG("[rdma_server] flush_all_staging: merged %zu entries -> %zu copies\n", n_entries, n_copies);
+#else
+        (void)data;
+#endif
+        return true;
+    }
+
 private:
     struct stored_graph {
         ggml_context_ptr ctx_ptr;
@@ -1974,6 +2325,68 @@ private:
         std::vector<void *> cross_device_allocs;  // temporary GPU allocations for cross-device copies
 #endif
     };
+
+    // Host staging buffer for RDMA Write path when GDR is not available
+    struct host_staging_info {
+        void *          host_ptr;   // Host pinned memory
+        size_t          size;       // Size of staging buffer
+        struct ibv_mr * mr;         // RDMA memory region
+    };
+
+    void alloc_host_staging(ggml_backend_buffer_t buffer, size_t size,
+                            rdma_connection * conn, rdma_msg_alloc_buffer_rsp & response) {
+#ifdef GGML_RDMA_CUDA
+        void * host_ptr = nullptr;
+        cudaError_t err = cudaMallocHost(&host_ptr, size);
+        if (err != cudaSuccess) {
+            GGML_LOG_ERROR("[server] Failed to allocate host staging (%zu B): %s\n",
+                           size, cudaGetErrorString(err));
+            return;
+        }
+#else
+        void * host_ptr = nullptr;
+        if (posix_memalign(&host_ptr, 4096, size) != 0) {
+            GGML_LOG_ERROR("[server] Failed to allocate host staging (%zu B)\n", size);
+            return;
+        }
+#endif
+
+        int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+        struct ibv_mr * mr = conn->register_memory(host_ptr, size, access_flags);
+        if (!mr) {
+            GGML_LOG_ERROR("[server] Failed to register host staging MR\n");
+#ifdef GGML_RDMA_CUDA
+            cudaFreeHost(host_ptr);
+#else
+            ::free(host_ptr);
+#endif
+            return;
+        }
+
+        staging_buffers_[buffer] = {host_ptr, size, mr};
+        response.mr_addr = (uint64_t)mr->addr;
+        response.mr_rkey = mr->rkey;
+
+        GGML_LOG_INFO("[server] Host staging allocated: %zu bytes at %p, mr_addr=0x%" PRIx64 ", mr_rkey=0x%x\n",
+                      size, host_ptr, response.mr_addr, response.mr_rkey);
+    }
+
+    void free_host_staging(ggml_backend_buffer_t buffer) {
+        auto it = staging_buffers_.find(buffer);
+        if (it == staging_buffers_.end()) return;
+
+        host_staging_info & info = it->second;
+        if (info.mr) {
+            ibv_dereg_mr(info.mr);
+        }
+#ifdef GGML_RDMA_CUDA
+        if (info.host_ptr) cudaFreeHost(info.host_ptr);
+#else
+        if (info.host_ptr) ::free(info.host_ptr);
+#endif
+        RDMA_LOG_DBG("[server] Host staging freed for buffer %p\n", (void*)buffer);
+        staging_buffers_.erase(it);
+    }
 
 #ifdef GGML_RDMA_CUDA
     // Fix cross-device tensor access by copying data from foreign devices to target device via host memory.
@@ -2140,6 +2553,7 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers_;
     std::unordered_map<ggml_backend_buffer_t, struct ibv_mr *> buffer_mrs_;
     std::unordered_map<ggml_backend_buffer_t, uint32_t> buffer_device_map_;
+    std::unordered_map<ggml_backend_buffer_t, host_staging_info> staging_buffers_;
 
     std::vector<stored_graph> stored_graphs_;
 };
@@ -2406,6 +2820,22 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                 case RDMA_CMD_GRAPH_COMPUTE_UPDATE: {
                     if (!server.graph_compute_update(msg_data)) {
                         fprintf(stderr, "graph_compute_update failed\n");
+                    }
+                    send_rsp_empty();
+                    break;
+                }
+                case RDMA_CMD_FLUSH_STAGING: {
+                    rdma_msg_flush_staging_req request;
+                    memcpy(&request, msg_data.data(), sizeof(request));
+                    if (!server.flush_staging(request)) {
+                        fprintf(stderr, "flush_staging failed\n");
+                    }
+                    send_rsp_empty();
+                    break;
+                }
+                case RDMA_CMD_FLUSH_ALL_STAGING: {
+                    if (!server.flush_all_staging(msg_data)) {
+                        fprintf(stderr, "flush_all_staging failed\n");
                     }
                     send_rsp_empty();
                     break;
