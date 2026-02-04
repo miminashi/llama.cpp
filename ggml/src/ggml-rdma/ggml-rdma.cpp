@@ -185,6 +185,8 @@ enum rdma_cmd : uint8_t {
     RDMA_CMD_GRAPH_COMPUTE_UPDATE,  // Graph compute with delta updates
     RDMA_CMD_FLUSH_STAGING,    // Flush host staging buffer to GPU (single buffer, specific region)
     RDMA_CMD_FLUSH_ALL_STAGING, // Flush all dirty staging buffers to GPU (batch flush before graph_compute)
+    RDMA_CMD_FLUSH_AND_RECOMPUTE,      // Flush + graph_recompute in one round-trip
+    RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE, // Flush + graph_compute_update in one round-trip
     RDMA_CMD_COUNT,
 };
 
@@ -1215,14 +1217,9 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
 
     GGML_ASSERT(cgraph->n_nodes > 0);
 
-    // Flush all dirty staging buffers to GPU before compute
-    // Sends accumulated dirty ranges from set_tensor RDMA Writes
+    // Drain pending flushes (from set_tensor RDMA Writes)
     auto pending = g_pending_flushes.drain();
-    if (!pending.empty()) {
-        bool flush_ok = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_ALL_STAGING,
-                                       pending.data(), pending.size() * sizeof(rdma_msg_flush_entry), nullptr);
-        RDMA_STATUS_ASSERT(flush_ok);
-    }
+    uint32_t n_flush = pending.size();
 
     bool reuse = ctx->gc.is_cached(cgraph);
     if (reuse) {
@@ -1232,29 +1229,47 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         ctx->gc.collect_updates(cgraph, updates, visited);
 
         if (updates.empty()) {
-            // Nothing changed at all - pure recompute
-            rdma_msg_graph_recompute_req request;
-            request.device = ctx->device;
-            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr);
+            // Pure recompute — combine flush + recompute in one round-trip
+            // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) |
+            size_t input_size = sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry) + sizeof(uint32_t);
+            std::vector<uint8_t> input(input_size);
+            uint8_t * dest = input.data();
+            memcpy(dest, &n_flush, sizeof(n_flush));
+            dest += sizeof(n_flush);
+            if (n_flush > 0) {
+                memcpy(dest, pending.data(), n_flush * sizeof(rdma_msg_flush_entry));
+                dest += n_flush * sizeof(rdma_msg_flush_entry);
+            }
+            memcpy(dest, &ctx->device, sizeof(ctx->device));
+
+            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE,
+                                        input.data(), input.size(), nullptr);
             RDMA_STATUS_ASSERT(status);
             if (RDMA_PROFILE) g_profile.graph_compute_recompute++;
         } else {
-            // Send delta updates only
-            // Wire format: | device(4B) | n_updates(4B) | rdma_tensor_update × n_updates |
+            // Delta updates — combine flush + compute_update in one round-trip
+            // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) | n_updates(4B) | updates(M*100B) |
             uint32_t n_updates = updates.size();
-            size_t input_size = sizeof(uint32_t) + sizeof(uint32_t) + n_updates * sizeof(rdma_tensor_update);
+            size_t input_size = sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry)
+                              + sizeof(uint32_t) + sizeof(uint32_t) + n_updates * sizeof(rdma_tensor_update);
             std::vector<uint8_t> input(input_size);
             uint8_t * dest = input.data();
+            memcpy(dest, &n_flush, sizeof(n_flush));
+            dest += sizeof(n_flush);
+            if (n_flush > 0) {
+                memcpy(dest, pending.data(), n_flush * sizeof(rdma_msg_flush_entry));
+                dest += n_flush * sizeof(rdma_msg_flush_entry);
+            }
             memcpy(dest, &ctx->device, sizeof(ctx->device));
             dest += sizeof(ctx->device);
             memcpy(dest, &n_updates, sizeof(n_updates));
             dest += sizeof(n_updates);
             memcpy(dest, updates.data(), n_updates * sizeof(rdma_tensor_update));
 
-            RDMA_LOG_DBG("[rdma] graph_compute_update: %u updates, %zu bytes (vs ~90KB full)\n",
-                         n_updates, input_size);
+            RDMA_LOG_DBG("[rdma] flush_and_compute_update: %u flushes + %u updates, %zu bytes\n",
+                         n_flush, n_updates, input_size);
 
-            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE_UPDATE,
+            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE,
                                         input.data(), input.size(), nullptr);
             RDMA_STATUS_ASSERT(status);
             if (RDMA_PROFILE) g_profile.graph_compute_update++;
@@ -1265,6 +1280,13 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         ctx->gc.add(cgraph);
     } else {
         // Full graph send (first time or structure changed)
+        // Flush separately if needed (full graph send is rare)
+        if (!pending.empty()) {
+            bool flush_ok = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_ALL_STAGING,
+                                           pending.data(), pending.size() * sizeof(rdma_msg_flush_entry), nullptr);
+            RDMA_STATUS_ASSERT(flush_ok);
+        }
+
         std::vector<uint8_t> input;
         serialize_graph(ctx->device, cgraph, input);
 
@@ -2058,6 +2080,7 @@ public:
     }
 
     bool graph_compute(const std::vector<uint8_t> & input) {
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         // serialization format:
         // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rdma_tensor)) |
         if (input.size() < 2*sizeof(uint32_t)) {
@@ -2087,6 +2110,7 @@ public:
         const rdma_tensor * tensors = (const rdma_tensor *)src;
         RDMA_LOG_DBG("[rdma_server] graph_compute: device=%u, n_nodes=%u, n_tensors=%u\n", device, n_nodes, n_tensors);
 
+        uint64_t t_deser = RDMA_PROFILE ? profile_now_us() : 0;
         size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
 
         struct ggml_init_params params = {
@@ -2115,6 +2139,8 @@ public:
                 return false;
             }
         }
+        uint64_t deser_us = RDMA_PROFILE ? profile_now_us() - t_deser : 0;
+
 #ifdef GGML_RDMA_CUDA
         // Free old cross-device allocs before replacing stored graph
         if (!stored_graphs_[device].cross_device_allocs.empty()) {
@@ -2129,16 +2155,27 @@ public:
         stored_graphs_[device].graph = graph;
         stored_graphs_[device].tensor_map = std::move(tensor_map);
 
+        uint64_t t_fix = 0;
 #ifdef GGML_RDMA_CUDA
+        if (RDMA_PROFILE) t_fix = profile_now_us();
         fix_cross_device_refs(graph, device, stored_graphs_[device]);
+        if (RDMA_PROFILE) t_fix = profile_now_us() - t_fix;
 #endif
 
+        uint64_t t_compute = RDMA_PROFILE ? profile_now_us() : 0;
         ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
+        uint64_t compute_us = RDMA_PROFILE ? profile_now_us() - t_compute : 0;
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] graph_compute (full): total=%.2f ms (deser=%.2f, fix_xdev=%.2f, compute=%.2f) nodes=%u tensors=%u\n",
+                    total/1000.0, deser_us/1000.0, t_fix/1000.0, compute_us/1000.0, n_nodes, n_tensors);
+        }
         return true;
     }
 
     bool graph_recompute(const rdma_msg_graph_recompute_req & request) {
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         uint32_t device = request.device;
         if (device >= backends_.size()) {
             return false;
@@ -2148,15 +2185,26 @@ public:
         }
         ggml_cgraph * graph = stored_graphs_[device].graph;
         RDMA_LOG_DBG("[rdma_server] graph_recompute: device=%u\n", device);
+        uint64_t t_fix = 0;
 #ifdef GGML_RDMA_CUDA
+        if (RDMA_PROFILE) t_fix = profile_now_us();
         fix_cross_device_refs(graph, device, stored_graphs_[device]);
+        if (RDMA_PROFILE) t_fix = profile_now_us() - t_fix;
 #endif
+        uint64_t t_compute = RDMA_PROFILE ? profile_now_us() : 0;
         ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
+        uint64_t compute_us = RDMA_PROFILE ? profile_now_us() - t_compute : 0;
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] graph_recompute: total=%.2f ms (fix_xdev=%.2f, compute=%.2f)\n",
+                    total/1000.0, t_fix/1000.0, compute_us/1000.0);
+        }
         return true;
     }
 
     bool graph_compute_update(const std::vector<uint8_t> & input) {
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         // Wire format: | device(4B) | n_updates(4B) | rdma_tensor_update × n_updates |
         if (input.size() < 2 * sizeof(uint32_t)) {
             return false;
@@ -2186,6 +2234,7 @@ public:
 
         RDMA_LOG_DBG("[rdma_server] graph_compute_update: device=%u, n_updates=%u\n", device, n_updates);
 
+        uint64_t t_apply = RDMA_PROFILE ? profile_now_us() : 0;
         for (uint32_t i = 0; i < n_updates; i++) {
             const rdma_tensor_update & upd = updates[i];
             auto it = tmap.find(upd.id);
@@ -2202,14 +2251,25 @@ public:
             }
             t->flags = upd.flags;
         }
+        uint64_t apply_us = RDMA_PROFILE ? profile_now_us() - t_apply : 0;
 
         // Recompute with updated graph
         ggml_cgraph * graph = stored_graphs_[device].graph;
+        uint64_t t_fix = 0;
 #ifdef GGML_RDMA_CUDA
+        if (RDMA_PROFILE) t_fix = profile_now_us();
         fix_cross_device_refs(graph, device, stored_graphs_[device]);
+        if (RDMA_PROFILE) t_fix = profile_now_us() - t_fix;
 #endif
+        uint64_t t_compute = RDMA_PROFILE ? profile_now_us() : 0;
         ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
+        uint64_t compute_us = RDMA_PROFILE ? profile_now_us() - t_compute : 0;
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] graph_compute_update: total=%.2f ms (apply=%u updates %.2f ms, fix_xdev=%.2f, compute=%.2f)\n",
+                    total/1000.0, n_updates, apply_us/1000.0, t_fix/1000.0, compute_us/1000.0);
+        }
         return true;
     }
 
@@ -2263,6 +2323,7 @@ public:
     // Merges overlapping/adjacent ranges per buffer to minimize cudaMemcpy calls
     bool flush_all_staging(const std::vector<uint8_t> & data) {
 #ifdef GGML_RDMA_CUDA
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         size_t n_entries = data.size() / sizeof(rdma_msg_flush_entry);
         const rdma_msg_flush_entry * entries = reinterpret_cast<const rdma_msg_flush_entry *>(data.data());
 
@@ -2309,11 +2370,91 @@ public:
             }
             n_copies++;
         }
-        RDMA_LOG_DBG("[rdma_server] flush_all_staging: merged %zu entries -> %zu copies\n", n_entries, n_copies);
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] flush_all_staging: %.2f ms (%zu entries -> %zu copies)\n",
+                    total/1000.0, n_entries, n_copies);
+        } else {
+            RDMA_LOG_DBG("[rdma_server] flush_all_staging: merged %zu entries -> %zu copies\n", n_entries, n_copies);
+        }
 #else
         (void)data;
 #endif
         return true;
+    }
+
+    // Combined flush + recompute in one round-trip
+    // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) |
+    bool flush_and_recompute(const std::vector<uint8_t> & input) {
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
+        const uint8_t * src = input.data();
+        if (input.size() < sizeof(uint32_t)) return false;
+
+        uint32_t n_flush;
+        memcpy(&n_flush, src, sizeof(n_flush));
+        src += sizeof(n_flush);
+
+        size_t flush_bytes = n_flush * sizeof(rdma_msg_flush_entry);
+        if (input.size() < sizeof(uint32_t) + flush_bytes + sizeof(uint32_t)) return false;
+
+        // Flush staging if needed
+        uint64_t flush_us = 0;
+        if (n_flush > 0) {
+            std::vector<uint8_t> flush_data(src, src + flush_bytes);
+            uint64_t tf = RDMA_PROFILE ? profile_now_us() : 0;
+            if (!flush_all_staging(flush_data)) return false;
+            flush_us = RDMA_PROFILE ? profile_now_us() - tf : 0;
+            src += flush_bytes;
+        }
+
+        // Recompute
+        rdma_msg_graph_recompute_req request;
+        memcpy(&request.device, src, sizeof(request.device));
+        bool ok = graph_recompute(request);
+
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] flush_and_recompute: total=%.2f ms (flush=%.2f, n_flush=%u)\n",
+                    total/1000.0, flush_us/1000.0, n_flush);
+        }
+        return ok;
+    }
+
+    // Combined flush + compute_update in one round-trip
+    // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) | n_updates(4B) | updates(M*100B) |
+    bool flush_and_compute_update(const std::vector<uint8_t> & input) {
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
+        const uint8_t * src = input.data();
+        if (input.size() < sizeof(uint32_t)) return false;
+
+        uint32_t n_flush;
+        memcpy(&n_flush, src, sizeof(n_flush));
+        src += sizeof(n_flush);
+
+        size_t flush_bytes = n_flush * sizeof(rdma_msg_flush_entry);
+        if (input.size() < sizeof(uint32_t) + flush_bytes + 2 * sizeof(uint32_t)) return false;
+
+        // Flush staging if needed
+        uint64_t flush_us = 0;
+        if (n_flush > 0) {
+            std::vector<uint8_t> flush_data(src, src + flush_bytes);
+            uint64_t tf = RDMA_PROFILE ? profile_now_us() : 0;
+            if (!flush_all_staging(flush_data)) return false;
+            flush_us = RDMA_PROFILE ? profile_now_us() - tf : 0;
+            src += flush_bytes;
+        }
+
+        // Compute update — remaining bytes are the compute_update payload
+        size_t remaining = input.size() - (src - input.data());
+        std::vector<uint8_t> compute_data(src, src + remaining);
+        bool ok = graph_compute_update(compute_data);
+
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] flush_and_compute_update: total=%.2f ms (flush=%.2f, n_flush=%u)\n",
+                    total/1000.0, flush_us/1000.0, n_flush);
+        }
+        return ok;
     }
 
 private:
@@ -2663,6 +2804,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
         const size_t cmd_header_size = 1 + sizeof(uint64_t);
         uint8_t header_buf[1 + sizeof(uint64_t)];
         while (true) {
+            uint64_t t_cmd_start = RDMA_PROFILE ? profile_now_us() : 0;
             if (!conn->recv(header_buf, cmd_header_size, nullptr)) {
                 break;
             }
@@ -2683,6 +2825,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     break;
                 }
             }
+            uint64_t recv_us = RDMA_PROFILE ? profile_now_us() - t_cmd_start : 0;
 
             switch (cmd) {
                 case RDMA_CMD_HELLO: {
@@ -2805,7 +2948,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     if (!server.graph_compute(msg_data)) {
                         fprintf(stderr, "graph_compute failed\n");
                     }
+                    uint64_t t_rsp = RDMA_PROFILE ? profile_now_us() : 0;
                     send_rsp_empty();
+                    if (RDMA_PROFILE) {
+                        uint64_t rsp_us = profile_now_us() - t_rsp;
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd GRAPH_COMPUTE: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
+                                total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
                     break;
                 }
                 case RDMA_CMD_GRAPH_RECOMPUTE: {
@@ -2814,14 +2964,28 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     if (!server.graph_recompute(request)) {
                         fprintf(stderr, "graph_recompute failed\n");
                     }
+                    uint64_t t_rsp_r = RDMA_PROFILE ? profile_now_us() : 0;
                     send_rsp_empty();
+                    if (RDMA_PROFILE) {
+                        uint64_t rsp_us = profile_now_us() - t_rsp_r;
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd GRAPH_RECOMPUTE: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
+                                total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
                     break;
                 }
                 case RDMA_CMD_GRAPH_COMPUTE_UPDATE: {
                     if (!server.graph_compute_update(msg_data)) {
                         fprintf(stderr, "graph_compute_update failed\n");
                     }
+                    uint64_t t_rsp_u = RDMA_PROFILE ? profile_now_us() : 0;
                     send_rsp_empty();
+                    if (RDMA_PROFILE) {
+                        uint64_t rsp_us = profile_now_us() - t_rsp_u;
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd GRAPH_COMPUTE_UPDATE: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
+                                total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
                     break;
                 }
                 case RDMA_CMD_FLUSH_STAGING: {
@@ -2837,7 +3001,42 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     if (!server.flush_all_staging(msg_data)) {
                         fprintf(stderr, "flush_all_staging failed\n");
                     }
+                    uint64_t t_rsp_f = RDMA_PROFILE ? profile_now_us() : 0;
                     send_rsp_empty();
+                    if (RDMA_PROFILE) {
+                        uint64_t rsp_us = profile_now_us() - t_rsp_f;
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd FLUSH_ALL_STAGING: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
+                                total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
+                    break;
+                }
+                case RDMA_CMD_FLUSH_AND_RECOMPUTE: {
+                    if (!server.flush_and_recompute(msg_data)) {
+                        fprintf(stderr, "flush_and_recompute failed\n");
+                    }
+                    uint64_t t_rsp_fr = RDMA_PROFILE ? profile_now_us() : 0;
+                    send_rsp_empty();
+                    if (RDMA_PROFILE) {
+                        uint64_t rsp_us = profile_now_us() - t_rsp_fr;
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd FLUSH_AND_RECOMPUTE: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
+                                total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
+                    break;
+                }
+                case RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE: {
+                    if (!server.flush_and_compute_update(msg_data)) {
+                        fprintf(stderr, "flush_and_compute_update failed\n");
+                    }
+                    uint64_t t_rsp_fu = RDMA_PROFILE ? profile_now_us() : 0;
+                    send_rsp_empty();
+                    if (RDMA_PROFILE) {
+                        uint64_t rsp_us = profile_now_us() - t_rsp_fu;
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd FLUSH_AND_COMPUTE_UPDATE: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
+                                total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
                     break;
                 }
                 default:
