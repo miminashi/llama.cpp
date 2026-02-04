@@ -8,6 +8,10 @@
 
 - llama.cppをビルドする際は、必ず事前に `build` ディレクトリを削除してからビルドすること (`rm -rf build && cmake -B build ...`)
 
+## コード転送ルール
+
+- 2号機 (192.168.100.2) にコードを転送する際は、2号機に既に存在するllama.cppのディレクトリを削除したうえで、1号機のコードをコピーすること
+
 ## 実行ルール
 
 - `llama-cli` を実行する際は、必ず `--log-file /tmp/llama-cli.log` オプションを付けること (ユーザが別ターミナルで `tail -f /tmp/llama-cli.log` によりリアルタイムにログを確認できるようにするため)
@@ -21,7 +25,7 @@
 上記の最終目標をいきなり達成するのは難しいため、以下のようなステップを設定して段階的に進める。
 
 1. **Step 1** ✅: GPUDirectでないRDMA + P2P無効 + gpt-ossなどの中程度のパラメータ数のモデル
-2. **Step 2**: マルチノードクラスタの安定化 (gpt-oss-120b を11GPUクラスタで安定動作)
+2. **Step 2** ✅: マルチノードクラスタの安定化 (gpt-oss-120b を11GPUクラスタで安定動作)
 3. **Step 3**: RDMA性能最適化 (性能損失50%以下、パイプライン化、非同期操作)
 4. **Step 4**: GPUDirect RDMA有効化 (CPU経由ステージング排除、GPU直接RDMA転送)
 5. **Step 5 (最終Step)**: GPUDirect RDMA + 2ノード16台P100 + GLM4.7 Q4
@@ -29,18 +33,15 @@
 ### ステップ間の依存関係
 
 ```
-Step 1 (完了) → Step 2 (クラスタ安定化) ★最優先
-                    ↓
-               Step 3 (性能最適化)
-                    ↓
-               Step 4 (GPUDirect RDMA)
-                    ↓
-               Step 5 (GLM4.7 on 16 P100s)
+Step 1 (完了) → Step 2 (完了) → Step 3 (性能最適化) ★現在
+                                      ↓
+                                 Step 4 (GPUDirect RDMA)
+                                      ↓
+                                 Step 5 (GLM4.7 on 16 P100s)
 ```
 
-- **安定化優先**: Step 2を最優先で進める
-- Step 3は Step 2完了後に着手 (安定した環境で性能測定するため)
-- Step 4は Step 2の完了が前提 (不安定な状態でGPUDirectを追加すると問題切り分けが困難)
+- Step 3を現在進行中 (安定した環境での性能最適化)
+- Step 4は Step 3完了後に着手
 - Step 5はハードウェア要件 (16台のP100) に依存するが、11台での事前検証は先行可能
 
 ### モデル分割方式
@@ -69,30 +70,14 @@ Step 1 (完了) → Step 2 (クラスタ安定化) ★最優先
 
 ---
 
-## Step 2: マルチノードクラスタの安定化
+## Step 2: マルチノードクラスタの安定化 ✅
 
-### 目標
-gpt-oss-120b を11GPUクラスタ (7ローカル + 4リモート) で安定動作させる。
-
-### タスク
-
-1. **120bクラスタ障害の原因調査と修正**
-   - CUDA illegal memory access エラーのデバッグ
-   - クライアント・サーバー間のバージョン整合性確認 (クライアントはfeature/rdma-backend、サーバーがmasterの可能性)
-   - 大規模MoEモデル (64 experts, Top-8) のグラフシリアライズ検証
-   - リモートサーバー側でのバッファ管理・メモリアクセス境界チェック
-
-2. **プロトコルの堅牢性向上**
-   - エラーハンドリングの改善 (障害時の詳細なエラー情報)
-   - 大規模グラフのシリアライズ/デシリアライズの検証
-
-### 成功基準
-- gpt-oss-120b が11GPUクラスタで安定的に推論完了できること
-- 複数プロンプトで再現性のある結果が得られること
-
-### 対象ファイル
-- `ggml/src/ggml-rdma/ggml-rdma.cpp` — グラフシリアライズ、バッファ管理
-- `ggml/src/ggml-rdma/rdma-transport.cpp` — エラーハンドリング
+### 達成内容
+- `supports_buft` バグ修正 (`strstr` → `strcmp`) でクロスデバイス問題を解決
+- チャンク送受信実装 (141MB MoEエキスパート重み対応)
+- クロスデバイスコピー安全ネット (D2H+H2D)
+- gpt-oss-20b/120b が11GPUクラスタ (7 CUDA + 4 RDMA) で安定動作
+- 120b: Prompt 3-11 t/s, Generation 0.7-1.1 t/s (複数プロンプトで再現確認済み)
 
 ---
 
@@ -198,6 +183,87 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 ### 備考
 - GPU追加前でも、11台でGLM4.7の事前検証は可能 (モデルがVRAMに収まる場合)
 - 収まらない場合はGPU追加を待つ
+
+---
+
+## ビルド・デプロイ・実行手順
+
+### 1号機 (192.168.100.1) でビルド
+
+```bash
+cd /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend
+rm -rf build && cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+### 2号機 (192.168.100.2) へのデプロイ
+
+```bash
+# 2号機の既存ディレクトリを削除してから転送
+ssh 192.168.100.2 "rm -rf /home/ubuntu/projects/llama.cpp"
+rsync -a --exclude='.git' /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/ 192.168.100.2:/home/ubuntu/projects/llama.cpp/
+
+# 2号機でビルド
+ssh 192.168.100.2 "cd /home/ubuntu/projects/llama.cpp && rm -rf build && cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j\$(nproc)"
+```
+
+### rdma-server 起動 (2号機)
+
+```bash
+ssh 192.168.100.2 "GGML_RDMA_NO_GDR=1 LD_LIBRARY_PATH=/home/ubuntu/projects/llama.cpp/build/bin \
+  nohup /home/ubuntu/projects/llama.cpp/build/bin/rdma-server -H 0.0.0.0 -p 50051 > /tmp/rdma-server.log 2>&1 &"
+```
+
+### llama-bench 実行 (1号機)
+
+**qwen2.5-0.5b 2GPU (CUDA0 + RDMA0)**
+```bash
+GGML_RDMA_NO_GDR=1 GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 \
+  build/bin/llama-bench \
+  -m /home/ubuntu/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  -ngl 999 -sm layer -r 1 -p 128 -n 32
+```
+
+**gpt-oss-20b 2GPU (CUDA0 + RDMA0)**
+```bash
+GGML_RDMA_NO_GDR=1 GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 \
+  build/bin/llama-bench \
+  -m /home/ubuntu/models/gpt-oss-20b-Q4_K_M.gguf \
+  -ngl 999 -sm layer -r 1 -p 128 -n 32
+```
+
+### llama-cli 実行 (1号機, 11GPU クラスタ)
+
+```bash
+GGML_RDMA_SERVERS=192.168.100.2:50051 GGML_RDMA_NO_GDR=1 \
+  LD_LIBRARY_PATH=build/bin \
+  build/bin/llama-cli \
+  -hf unsloth/gpt-oss-120b-GGUF:Q4_K_M \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -c 2048 -p 'こんにちは' -n 50 \
+  --no-warmup --single-turn --simple-io \
+  --log-file /tmp/llama-cli.log
+```
+
+### 環境変数一覧
+
+| 環境変数 | 説明 | デフォルト |
+|---------|------|----------|
+| `GGML_RDMA_SERVERS` | RDMA サーバーリスト (host:port) | 未設定 |
+| `GGML_RDMA_NO_GDR` | `1` で GPUDirect RDMA を無効化 | 未設定 (GDR有効) |
+| `GGML_RDMA_NO_STAGING` | `1` でホストステージングバッファを無効化 (Send/Recvフォールバック) | 未設定 |
+| `GGML_RDMA_PROFILE` | `1` でクライアント側プロファイリング有効化 | 未設定 |
+| `GGML_RDMA_DEBUG` | `1` でデバッグログ出力 | 未設定 |
+
+### よくあるエラーと対処法
+
+| エラー | 原因 | 対処法 |
+|-------|------|--------|
+| `CUDA illegal memory access` | `supports_buft` のバグ (修正済み) またはクロスデバイスアクセス | コードが最新か確認。2号機のバイナリが古い可能性 |
+| `Connection refused` | rdma-server が起動していない | 2号機で `ps aux \| grep rdma` 確認、サーバー再起動 |
+| `RDMA write completion timeout` | ステージングバッファの MR 情報不一致 | サーバーを再起動してバッファ再登録 |
+| `chunk recv` ログ大量出力 | 大きなテンソル (>16MB) の転送 | 正常動作。MoEモデルで頻発 |
+| `llama_params_fit` クラッシュ | スレッド安全性の問題 (修正済み) | `op_mutex_` による保護が有効か確認 |
 
 ---
 
