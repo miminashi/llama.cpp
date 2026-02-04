@@ -1,0 +1,27 @@
+set(TARGET rdma-server)
+add_executable(${TARGET} rdma-server.cpp)
+target_link_libraries(${TARGET} PRIVATE ggml)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+set(TARGET2 rdma-test-client)
+add_executable(${TARGET2} rdma-test-client.cpp)
+target_link_libraries(${TARGET2} PRIVATE ggml)
+target_compile_features(${TARGET2} PRIVATE cxx_std_17)
+
+set(TARGET3 rdma-simple-test)
+add_executable(${TARGET3} rdma-simple-test.cpp)
+target_link_libraries(${TARGET3} PRIVATE ggml)
+target_compile_features(${TARGET3} PRIVATE cxx_std_17)
+
+# Link CUDA runtime if available (needed for ggml-rdma)
+if(GGML_CUDA)
+    find_package(CUDAToolkit)
+    if(CUDAToolkit_FOUND)
+        target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
+        target_link_libraries(${TARGET2} PRIVATE CUDA::cudart)
+    endif()
+endif()
+
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} ${TARGET2} RUNTIME)
+endif()
