@@ -30,6 +30,11 @@ static const char * RDMA_DEBUG = std::getenv("GGML_RDMA_DEBUG");
 // Row padding for quantized tensors (must match server-side value)
 #define RDMA_MATRIX_ROW_PADDING 512
 
+// Adaptive response threshold: responses <= this size are sent as a single
+// [size(8B)|data(NB)] message; larger responses use two separate sends for
+// zero-copy support. Covers all fixed-size response structs (max 28B).
+#define RDMA_ADAPTIVE_RSP_THRESHOLD 256
+
 // All RDMA structures must be packed for wire protocol
 #pragma pack(push, 1)
 
@@ -251,6 +256,8 @@ struct ggml_backend_rdma_buffer_context {
     size_t   size;
     // Local memory pool for staging
     std::unique_ptr<rdma_memory_pool> mem_pool;
+    // Persistent staging buffer for set_tensor/get_tensor RDMA transfers
+    std::unique_ptr<rdma_staging_buffer> staging;
 };
 
 struct graph_cache {
@@ -479,12 +486,33 @@ static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * inp
     return true;
 }
 
-// Receive response: size(8B) in first recv, then data(NB) directly into output buffer.
-// Eliminates intermediate vector allocation and memcpy for large responses.
+// Receive response: adaptive recv based on output_size.
+// Small responses (<= RDMA_ADAPTIVE_RSP_THRESHOLD): single recv of [size(8B)|data(NB)].
+// Large responses (> RDMA_ADAPTIVE_RSP_THRESHOLD): two recvs for zero-copy into output buffer.
 static bool recv_rdma_rsp(rdma_connection * conn, void * output, size_t output_size,
                           struct ibv_mr * recv_mr) {
     (void)recv_mr; // No longer used - internal buffer handles all sizes
 
+    if (output_size <= RDMA_ADAPTIVE_RSP_THRESHOLD) {
+        // Small response: single recv of [size(8B)|data(NB)]
+        uint8_t combined[sizeof(uint64_t) + RDMA_ADAPTIVE_RSP_THRESHOLD];
+        size_t recv_size = sizeof(uint64_t) + output_size;
+        if (!conn->recv(combined, recv_size, nullptr)) {
+            return false;
+        }
+        uint64_t size = 0;
+        memcpy(&size, combined, sizeof(size));
+        if (size != output_size) {
+            GGML_LOG_ERROR("[rdma] Response size mismatch: expected %zu, got %" PRIu64 "\n", output_size, size);
+            return false;
+        }
+        if (output_size > 0) {
+            memcpy(output, combined + sizeof(uint64_t), output_size);
+        }
+        return true;
+    }
+
+    // Large response: two recvs for zero-copy
     // Recv 1: size header
     uint64_t size = 0;
     if (!conn->recv(&size, sizeof(size), nullptr)) {
@@ -496,10 +524,8 @@ static bool recv_rdma_rsp(rdma_connection * conn, void * output, size_t output_s
     }
 
     // Recv 2: data directly into output buffer (zero-copy)
-    if (output_size > 0) {
-        if (!conn->recv(output, output_size, nullptr)) {
-            return false;
-        }
+    if (!conn->recv(output, output_size, nullptr)) {
+        return false;
     }
     return true;
 }
@@ -519,12 +545,14 @@ static bool check_server_version(rdma_connection * conn) {
     rdma_msg_hello_rsp response;
     bool status = send_rdma_cmd_with_rsp(conn, RDMA_CMD_HELLO, nullptr, 0, &response, sizeof(response));
     RDMA_STATUS_ASSERT(status);
-    if (response.major != RDMA_PROTO_MAJOR_VERSION || response.minor > RDMA_PROTO_MINOR_VERSION) {
-        GGML_LOG_ERROR("RDMA server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
+    if (response.major != RDMA_PROTO_MAJOR_VERSION || response.minor != RDMA_PROTO_MINOR_VERSION) {
+        GGML_LOG_ERROR("RDMA server version mismatch: server %d.%d.%d, client %d.%d.%d\n",
+                       response.major, response.minor, response.patch,
+                       RDMA_PROTO_MAJOR_VERSION, RDMA_PROTO_MINOR_VERSION, RDMA_PROTO_PATCH_VERSION);
         return false;
     }
-    if (response.minor != RDMA_PROTO_MINOR_VERSION || response.patch != RDMA_PROTO_PATCH_VERSION) {
-        GGML_LOG_INFO("WARNING: RDMA server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
+    if (response.patch != RDMA_PROTO_PATCH_VERSION) {
+        GGML_LOG_INFO("WARNING: RDMA server patch version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
     }
     return true;
 }
@@ -624,31 +652,25 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         ggml_backend_rdma_buffer_get_base(buffer);
     }
 
-    // Try RDMA write if we have MR info and base_ptr is valid
-    if (ctx->mr_rkey != 0 && ctx->mem_pool && ctx->base_ptr != nullptr) {
-        // Allocate staging buffer and register for RDMA
-        memory_region_info * staging = ctx->mem_pool->alloc(size, alloc_type::HOST_PINNED);
-        if (staging) {
-            // Copy data to staging buffer
-            memcpy(staging->addr, data, size);
+    // Try RDMA write if we have MR info, staging buffer, and base_ptr is valid
+    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr) {
+        struct ibv_mr * mr = nullptr;
+        void * buf = ctx->staging->get_buffer(size, &mr);
+        if (buf) {
+            memcpy(buf, data, size);
 
-            // Calculate remote address
             remote_memory_info remote;
             remote.addr = ctx->mr_addr + (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
             remote.rkey = ctx->mr_rkey;
             remote.size = size;
 
-            // Perform RDMA write
             RDMA_LOG_DBG("[rdma_set_tensor] About to RDMA write: remote.addr=0x%lx, base_ptr=%p, tensor->data=%p\n",
                          remote.addr, ctx->base_ptr, tensor->data);
-            if (ctx->conn->rdma_write(staging->addr, size, staging->mr, remote, true)) {
-                RDMA_LOG_DBG("[rdma_set_tensor] RDMA write succeeded, freeing staging\n");
-                ctx->mem_pool->free(staging);
-                RDMA_LOG_DBG("[rdma_set_tensor] Staging freed, returning\n");
+            if (ctx->conn->rdma_write(buf, size, mr, remote, true)) {
+                RDMA_LOG_DBG("[rdma_set_tensor] RDMA write succeeded\n");
                 return;
             }
-            RDMA_LOG_DBG("[rdma_set_tensor] RDMA write failed, freeing staging and falling back\n");
-            ctx->mem_pool->free(staging);
+            RDMA_LOG_DBG("[rdma_set_tensor] RDMA write failed, falling back\n");
         }
     }
 
@@ -673,23 +695,21 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         ggml_backend_rdma_buffer_get_base(const_cast<ggml_backend_buffer_t>(buffer));
     }
 
-    // Try RDMA read if we have MR info and base_ptr is valid
-    if (ctx->mr_rkey != 0 && ctx->mem_pool && ctx->base_ptr != nullptr) {
-        memory_region_info * staging = ctx->mem_pool->alloc(size, alloc_type::HOST_PINNED);
-        if (staging) {
+    // Try RDMA read if we have MR info, staging buffer, and base_ptr is valid
+    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr) {
+        struct ibv_mr * mr = nullptr;
+        void * buf = ctx->staging->get_buffer(size, &mr);
+        if (buf) {
             remote_memory_info remote;
             remote.addr = ctx->mr_addr + (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
             remote.rkey = ctx->mr_rkey;
             remote.size = size;
 
-            if (ctx->conn->rdma_read(staging->addr, size, staging->mr, remote, true)) {
-                memcpy(data, staging->addr, size);
-                ctx->mem_pool->free(staging);
+            if (ctx->conn->rdma_read(buf, size, mr, remote, true)) {
+                memcpy(data, buf, size);
                 RDMA_LOG_DBG("[rdma] RDMA read: %zu bytes from tensor %s\n", size, tensor->name);
                 return;
             }
-
-            ctx->mem_pool->free(staging);
         }
     }
 
@@ -769,6 +789,11 @@ static ggml_backend_buffer_t ggml_backend_rdma_buffer_type_alloc_buffer(ggml_bac
     RDMA_STATUS_ASSERT(status);
 
     if (response.remote_ptr != 0) {
+        auto mem_pool = std::make_unique<rdma_memory_pool>(conn.get());
+        std::unique_ptr<rdma_staging_buffer> staging;
+        if (response.mr_rkey != 0) {
+            staging = std::make_unique<rdma_staging_buffer>(mem_pool.get());
+        }
         auto * ctx = new ggml_backend_rdma_buffer_context {
             conn,
             nullptr,
@@ -776,7 +801,8 @@ static ggml_backend_buffer_t ggml_backend_rdma_buffer_type_alloc_buffer(ggml_bac
             response.mr_addr,
             response.mr_rkey,
             response.remote_size,
-            std::make_unique<rdma_memory_pool>(conn.get())
+            std::move(mem_pool),
+            std::move(staging),
         };
 
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
@@ -2069,19 +2095,26 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
         // In production, this should be multi-threaded
         rdma_server server(backends, cache_dir);
 
-        // Helper: send response as two sends: size(8B) then data(NB).
-        // Eliminates intermediate vector allocation and memcpy.
+        // Helper: adaptive response send.
+        // Small responses (<= threshold): single send of [size(8B)|data(NB)].
+        // Large responses (> threshold): two sends for zero-copy.
         auto send_rsp = [&](const void * data, size_t data_size) -> bool {
+            if (data_size <= RDMA_ADAPTIVE_RSP_THRESHOLD) {
+                // Small response: combine size + data in one send
+                uint8_t combined[sizeof(uint64_t) + RDMA_ADAPTIVE_RSP_THRESHOLD];
+                uint64_t sz = data_size;
+                memcpy(combined, &sz, sizeof(sz));
+                if (data_size > 0) {
+                    memcpy(combined + sizeof(uint64_t), data, data_size);
+                }
+                return conn->send(combined, sizeof(uint64_t) + data_size, nullptr);
+            }
+            // Large response: two sends for zero-copy
             uint64_t sz = data_size;
             if (!conn->send(&sz, sizeof(sz), nullptr)) {
                 return false;
             }
-            if (data_size > 0) {
-                if (!conn->send(data, data_size, nullptr)) {
-                    return false;
-                }
-            }
-            return true;
+            return conn->send(data, data_size, nullptr);
         };
 
         // Helper: send response with no data (rsp_size = 0)
