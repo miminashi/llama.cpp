@@ -77,6 +77,7 @@ enum rdma_cmd : uint8_t {
     RDMA_CMD_GET_MR_INFO,      // Get memory region info for RDMA ops
     RDMA_CMD_RDMA_WRITE_DONE,  // Notify completion of RDMA write
     RDMA_CMD_RDMA_READ_DONE,   // Notify completion of RDMA read
+    RDMA_CMD_GRAPH_COMPUTE_UPDATE,  // Graph compute with delta updates
     RDMA_CMD_COUNT,
 };
 
@@ -181,6 +182,15 @@ struct rdma_msg_graph_recompute_req {
     uint32_t device;
 };
 
+// Delta update for a single tensor (used by GRAPH_COMPUTE_UPDATE)
+struct rdma_tensor_update {
+    uint64_t id;                                          // 8B - tensor pointer as ID
+    int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)]; // 64B
+    uint64_t data;                                        // 8B
+    uint32_t nb[GGML_MAX_DIMS];                          // 16B
+    int32_t  flags;                                       // 4B
+};  // 100B total
+
 // RDMA-specific message structures
 struct rdma_msg_register_mr_req {
     uint64_t remote_ptr;  // Buffer pointer
@@ -244,18 +254,34 @@ struct ggml_backend_rdma_buffer_context {
 };
 
 struct graph_cache {
+    // Structural comparison: only compare fields that define graph topology
+    // (n_nodes, type, op, ne[], src[] pointers). Fields like data, op_params,
+    // buffer, nb, flags change between tokens but don't alter graph structure.
     bool is_cached(const ggml_cgraph * cgraph) {
         if ((int)last_graph.size() != cgraph->n_nodes) {
             return false;
         }
         for (int i = 0; i < cgraph->n_nodes; i++) {
-            if (memcmp(&last_graph[i], cgraph->nodes[i], sizeof(ggml_tensor)) != 0) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            const ggml_tensor & cached = last_graph[i];
+            if (t->type != cached.type || t->op != cached.op) {
                 return false;
+            }
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (t->ne[d] != cached.ne[d]) {
+                    return false;
+                }
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (t->src[s] != cached.src[s]) {
+                    return false;
+                }
             }
         }
         return true;
     }
 
+    // Save full tensor snapshots for diff detection in GRAPH_COMPUTE_UPDATE
     void add(const ggml_cgraph * cgraph) {
         last_graph.resize(cgraph->n_nodes);
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -263,7 +289,121 @@ struct graph_cache {
         }
     }
 
+    // Collect tensor updates: compare current tensors against saved snapshots
+    // and return updates for tensors whose mutable fields have changed.
+    void collect_updates(const ggml_cgraph * cgraph,
+                         std::vector<rdma_tensor_update> & updates,
+                         std::unordered_set<ggml_tensor*> & visited) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            collect_tensor_updates(cgraph->nodes[i], updates, visited);
+        }
+    }
+
     std::vector<ggml_tensor> last_graph;
+
+private:
+    void collect_tensor_updates(ggml_tensor * tensor,
+                                std::vector<rdma_tensor_update> & updates,
+                                std::unordered_set<ggml_tensor*> & visited) {
+        if (tensor == nullptr) return;
+        if (visited.count(tensor)) return;
+        visited.insert(tensor);
+
+        // Recurse into sources first
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            collect_tensor_updates(tensor->src[i], updates, visited);
+        }
+        collect_tensor_updates(tensor->view_src, updates, visited);
+
+        // Check if this tensor exists in our snapshot (by pointer match in last_graph nodes)
+        // We check all saved nodes and their sources
+        const ggml_tensor * snapshot = find_snapshot(tensor);
+        if (snapshot == nullptr) {
+            // New tensor not in previous graph - must send update
+            rdma_tensor_update upd;
+            upd.id = reinterpret_cast<uint64_t>(tensor);
+            memcpy(upd.op_params, tensor->op_params, sizeof(upd.op_params));
+            upd.data = reinterpret_cast<uint64_t>(tensor->data);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                upd.nb[d] = tensor->nb[d];
+            }
+            upd.flags = tensor->flags;
+            updates.push_back(upd);
+            return;
+        }
+
+        // Compare mutable fields
+        bool changed = false;
+        if (memcmp(tensor->op_params, snapshot->op_params, sizeof(tensor->op_params)) != 0) changed = true;
+        if (tensor->data != snapshot->data) changed = true;
+        if (tensor->flags != snapshot->flags) changed = true;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            if (tensor->nb[d] != snapshot->nb[d]) { changed = true; break; }
+        }
+
+        if (changed) {
+            rdma_tensor_update upd;
+            upd.id = reinterpret_cast<uint64_t>(tensor);
+            memcpy(upd.op_params, tensor->op_params, sizeof(upd.op_params));
+            upd.data = reinterpret_cast<uint64_t>(tensor->data);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                upd.nb[d] = tensor->nb[d];
+            }
+            upd.flags = tensor->flags;
+            updates.push_back(upd);
+        }
+    }
+
+    const ggml_tensor * find_snapshot(const ggml_tensor * tensor) {
+        // Search saved snapshots - snapshot[i] corresponds to the tensor that was
+        // at the same address (pointer) as tensor
+        for (size_t i = 0; i < last_graph.size(); i++) {
+            if (find_in_tensor_tree(&last_graph[i], tensor)) {
+                return find_in_tensor_tree(&last_graph[i], tensor);
+            }
+        }
+        return nullptr;
+    }
+
+    // Search for a tensor with matching pointer address in the saved snapshot tree
+    const ggml_tensor * find_in_tensor_tree(const ggml_tensor * root, const ggml_tensor * target) {
+        // We saved snapshots by memcpy from the original tensor. The original tensor
+        // was at address 'target'. But we stored snapshots at different addresses.
+        // We need a different approach: use snapshot_map_.
+        (void)root;
+        auto it = snapshot_map_.find(reinterpret_cast<uint64_t>(target));
+        if (it != snapshot_map_.end()) {
+            return it->second;
+        }
+        return nullptr;
+    }
+
+public:
+    // Build snapshot map: maps tensor pointer (uint64_t) -> snapshot pointer
+    void build_snapshot_map(const ggml_cgraph * cgraph) {
+        snapshot_map_.clear();
+        std::unordered_set<ggml_tensor*> visited;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            build_snapshot_map_recursive(cgraph->nodes[i], visited);
+        }
+    }
+
+private:
+    void build_snapshot_map_recursive(ggml_tensor * tensor, std::unordered_set<ggml_tensor*> & visited) {
+        if (tensor == nullptr || visited.count(tensor)) return;
+        visited.insert(tensor);
+        // Save snapshot: we store a copy of the tensor keyed by its original address
+        auto & snap = snapshot_all_[reinterpret_cast<uint64_t>(tensor)];
+        memcpy(&snap, tensor, sizeof(ggml_tensor));
+        snapshot_map_[reinterpret_cast<uint64_t>(tensor)] = &snap;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            build_snapshot_map_recursive(tensor->src[i], visited);
+        }
+        build_snapshot_map_recursive(tensor->view_src, visited);
+    }
+
+    std::unordered_map<uint64_t, ggml_tensor> snapshot_all_;
+    std::unordered_map<uint64_t, const ggml_tensor*> snapshot_map_;
 };
 
 struct ggml_backend_rdma_context {
@@ -339,26 +479,27 @@ static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * inp
     return true;
 }
 
-// Receive response: | output_size (8 bytes) | output_data (N bytes) |
-// All parts received in a single RDMA RECV to minimize completions.
+// Receive response: size(8B) in first recv, then data(NB) directly into output buffer.
+// Eliminates intermediate vector allocation and memcpy for large responses.
 static bool recv_rdma_rsp(rdma_connection * conn, void * output, size_t output_size,
                           struct ibv_mr * recv_mr) {
     (void)recv_mr; // No longer used - internal buffer handles all sizes
 
-    const size_t total_size = sizeof(uint64_t) + output_size;
-    std::vector<uint8_t> buf(total_size);
-    if (!conn->recv(buf.data(), total_size, nullptr)) {
+    // Recv 1: size header
+    uint64_t size = 0;
+    if (!conn->recv(&size, sizeof(size), nullptr)) {
         return false;
     }
-
-    uint64_t size = 0;
-    std::memcpy(&size, buf.data(), sizeof(size));
     if (size != output_size) {
         GGML_LOG_ERROR("[rdma] Response size mismatch: expected %zu, got %" PRIu64 "\n", output_size, size);
         return false;
     }
+
+    // Recv 2: data directly into output buffer (zero-copy)
     if (output_size > 0) {
-        std::memcpy(output, buf.data() + sizeof(uint64_t), output_size);
+        if (!conn->recv(output, output_size, nullptr)) {
+            return false;
+        }
     }
     return true;
 }
@@ -840,18 +981,52 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
 
     bool reuse = ctx->gc.is_cached(cgraph);
     if (reuse) {
-        rdma_msg_graph_recompute_req request;
-        request.device = ctx->device;
-        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr);
-        RDMA_STATUS_ASSERT(status);
-    } else {
+        // Graph structure matches - check for mutable field changes
+        std::vector<rdma_tensor_update> updates;
+        std::unordered_set<ggml_tensor*> visited;
+        ctx->gc.collect_updates(cgraph, updates, visited);
+
+        if (updates.empty()) {
+            // Nothing changed at all - pure recompute
+            rdma_msg_graph_recompute_req request;
+            request.device = ctx->device;
+            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr);
+            RDMA_STATUS_ASSERT(status);
+        } else {
+            // Send delta updates only
+            // Wire format: | device(4B) | n_updates(4B) | rdma_tensor_update × n_updates |
+            uint32_t n_updates = updates.size();
+            size_t input_size = sizeof(uint32_t) + sizeof(uint32_t) + n_updates * sizeof(rdma_tensor_update);
+            std::vector<uint8_t> input(input_size);
+            uint8_t * dest = input.data();
+            memcpy(dest, &ctx->device, sizeof(ctx->device));
+            dest += sizeof(ctx->device);
+            memcpy(dest, &n_updates, sizeof(n_updates));
+            dest += sizeof(n_updates);
+            memcpy(dest, updates.data(), n_updates * sizeof(rdma_tensor_update));
+
+            RDMA_LOG_DBG("[rdma] graph_compute_update: %u updates, %zu bytes (vs ~90KB full)\n",
+                         n_updates, input_size);
+
+            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE_UPDATE,
+                                        input.data(), input.size(), nullptr);
+            RDMA_STATUS_ASSERT(status);
+        }
+
+        // Update snapshots for next diff
+        ctx->gc.build_snapshot_map(cgraph);
         ctx->gc.add(cgraph);
+    } else {
+        // Full graph send (first time or structure changed)
         std::vector<uint8_t> input;
         serialize_graph(ctx->device, cgraph, input);
 
         bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr);
-
         RDMA_STATUS_ASSERT(status);
+
+        // Save snapshots for future diffs
+        ctx->gc.build_snapshot_map(cgraph);
+        ctx->gc.add(cgraph);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1645,7 +1820,7 @@ public:
             tensor_ptrs.emplace(tensors[i].id, &tensors[i]);
         }
         std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
-        tensor_map.reserve(n_nodes);
+        tensor_map.reserve(n_tensors);
         for (uint32_t i = 0; i < n_nodes; i++) {
             int64_t id;
             memcpy(&id, &nodes[i], sizeof(id));
@@ -1659,6 +1834,7 @@ public:
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
         stored_graphs_[device].ctx_ptr.swap(ctx_ptr);
         stored_graphs_[device].graph = graph;
+        stored_graphs_[device].tensor_map = std::move(tensor_map);
         return true;
     }
 
@@ -1672,6 +1848,60 @@ public:
         }
         ggml_cgraph * graph = stored_graphs_[device].graph;
         RDMA_LOG_DBG("[rdma_server] graph_recompute: device=%u\n", device);
+        ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
+        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+        return true;
+    }
+
+    bool graph_compute_update(const std::vector<uint8_t> & input) {
+        // Wire format: | device(4B) | n_updates(4B) | rdma_tensor_update × n_updates |
+        if (input.size() < 2 * sizeof(uint32_t)) {
+            return false;
+        }
+        const uint8_t * src = input.data();
+        uint32_t device;
+        memcpy(&device, src, sizeof(device));
+        src += sizeof(device);
+        if (device >= backends_.size()) {
+            return false;
+        }
+        if (stored_graphs_[device].graph == nullptr) {
+            GGML_LOG_ERROR("[rdma_server] graph_compute_update: no stored graph for device %u\n", device);
+            return false;
+        }
+
+        uint32_t n_updates;
+        memcpy(&n_updates, src, sizeof(n_updates));
+        src += sizeof(n_updates);
+
+        if (input.size() < 2 * sizeof(uint32_t) + n_updates * sizeof(rdma_tensor_update)) {
+            return false;
+        }
+
+        const rdma_tensor_update * updates = (const rdma_tensor_update *)src;
+        auto & tmap = stored_graphs_[device].tensor_map;
+
+        RDMA_LOG_DBG("[rdma_server] graph_compute_update: device=%u, n_updates=%u\n", device, n_updates);
+
+        for (uint32_t i = 0; i < n_updates; i++) {
+            const rdma_tensor_update & upd = updates[i];
+            auto it = tmap.find(upd.id);
+            if (it == tmap.end()) {
+                RDMA_LOG_DBG("[rdma_server] graph_compute_update: tensor id 0x%" PRIx64 " not found in stored graph\n", upd.id);
+                continue;
+            }
+            ggml_tensor * t = it->second;
+            // Apply mutable field updates
+            memcpy(t->op_params, upd.op_params, sizeof(t->op_params));
+            t->data = reinterpret_cast<void *>(upd.data);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                t->nb[d] = upd.nb[d];
+            }
+            t->flags = upd.flags;
+        }
+
+        // Recompute with updated graph
+        ggml_cgraph * graph = stored_graphs_[device].graph;
         ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
         return true;
@@ -1763,6 +1993,7 @@ private:
     struct stored_graph {
         ggml_context_ptr ctx_ptr;
         ggml_cgraph * graph;
+        std::unordered_map<uint64_t, ggml_tensor*> tensor_map;  // id -> tensor pointer for delta updates
     };
     std::vector<stored_graph> stored_graphs_;
 };
@@ -1838,16 +2069,19 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
         // In production, this should be multi-threaded
         rdma_server server(backends, cache_dir);
 
-        // Helper: send unified response [rsp_size(8B) | rsp_data(NB)] in a single SEND
+        // Helper: send response as two sends: size(8B) then data(NB).
+        // Eliminates intermediate vector allocation and memcpy.
         auto send_rsp = [&](const void * data, size_t data_size) -> bool {
-            const size_t total = sizeof(uint64_t) + data_size;
-            std::vector<uint8_t> buf(total);
             uint64_t sz = data_size;
-            std::memcpy(buf.data(), &sz, sizeof(sz));
-            if (data_size > 0) {
-                std::memcpy(buf.data() + sizeof(uint64_t), data, data_size);
+            if (!conn->send(&sz, sizeof(sz), nullptr)) {
+                return false;
             }
-            return conn->send(buf.data(), total, nullptr);
+            if (data_size > 0) {
+                if (!conn->send(data, data_size, nullptr)) {
+                    return false;
+                }
+            }
+            return true;
         };
 
         // Helper: send response with no data (rsp_size = 0)
@@ -2012,6 +2246,13 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     memcpy(&request, msg_data.data(), sizeof(request));
                     if (!server.graph_recompute(request)) {
                         fprintf(stderr, "graph_recompute failed\n");
+                    }
+                    send_rsp_empty();
+                    break;
+                }
+                case RDMA_CMD_GRAPH_COMPUTE_UPDATE: {
+                    if (!server.graph_compute_update(msg_data)) {
+                        fprintf(stderr, "graph_compute_update failed\n");
                     }
                     send_rsp_empty();
                     break;
