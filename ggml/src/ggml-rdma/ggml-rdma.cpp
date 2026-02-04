@@ -7,6 +7,10 @@
 #include "rdma-memory.h"
 #include "rdma-gdr.h"
 
+#ifdef GGML_RDMA_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <cinttypes>
 #include <string>
 #include <vector>
@@ -1163,8 +1167,9 @@ static bool ggml_backend_rdma_device_supports_buft(ggml_backend_dev_t dev, ggml_
     }
 
     ggml_backend_rdma_device_context * ctx = (ggml_backend_rdma_device_context *)dev->context;
-    // Support RDMA buffers from same endpoint
-    return strstr(name, ctx->endpoint.c_str()) != nullptr;
+    // Only support this device's own buffer type (e.g., "RDMA0[192.168.100.2:50051]")
+    // Must match both device number and endpoint, not just endpoint
+    return strcmp(name, ctx->name.c_str()) == 0;
 }
 
 static ggml_backend_device_i ggml_backend_rdma_device_interface = {
@@ -1567,19 +1572,25 @@ public:
             response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
             response.remote_size = buffer->size;
             buffers_.insert(buffer);
+            buffer_device_map_[buffer] = dev_id;
 
-            // Register buffer for RDMA access
-            void * base = ggml_backend_buffer_get_base(buffer);
-            int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-            struct ibv_mr * mr = conn->register_memory(base, buffer->size, access_flags);
-            if (mr) {
-                response.mr_addr = (uint64_t)mr->addr;
-                response.mr_rkey = mr->rkey;
-                buffer_mrs_[buffer] = mr;
+            // Register buffer for RDMA access (only when GDR is available)
+            if (gdr_memory_manager::is_available()) {
+                void * base = ggml_backend_buffer_get_base(buffer);
+                int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+                struct ibv_mr * mr = conn->register_memory(base, buffer->size, access_flags);
+                if (mr) {
+                    buffer_mrs_[buffer] = mr;
+                    response.mr_addr = (uint64_t)mr->addr;
+                    response.mr_rkey = mr->rkey;
+                }
+            } else {
+                RDMA_LOG_DBG("[server] Skipping MR registration (GDR disabled)\n");
             }
 
-            RDMA_LOG_DBG("[server] Allocated buffer: ptr=%p, size=%zu, mr_addr=0x%lx, mr_rkey=0x%x\n",
-                         (void*)response.remote_ptr, (size_t)response.remote_size,
+            void * base = ggml_backend_buffer_get_base(buffer);
+            RDMA_LOG_DBG("[server] Allocated buffer: dev=%u, ptr=%p, base=%p, size=%zu, mr_addr=0x%lx, mr_rkey=0x%x\n",
+                         dev_id, (void*)response.remote_ptr, base, (size_t)response.remote_size,
                          response.mr_addr, response.mr_rkey);
         }
         return true;
@@ -1856,11 +1867,26 @@ public:
                 return false;
             }
         }
-        ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
-        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+#ifdef GGML_RDMA_CUDA
+        // Free old cross-device allocs before replacing stored graph
+        if (!stored_graphs_[device].cross_device_allocs.empty()) {
+            cudaSetDevice(device);
+            for (void * ptr : stored_graphs_[device].cross_device_allocs) {
+                cudaFree(ptr);
+            }
+            stored_graphs_[device].cross_device_allocs.clear();
+        }
+#endif
         stored_graphs_[device].ctx_ptr.swap(ctx_ptr);
         stored_graphs_[device].graph = graph;
         stored_graphs_[device].tensor_map = std::move(tensor_map);
+
+#ifdef GGML_RDMA_CUDA
+        fix_cross_device_refs(graph, device, stored_graphs_[device]);
+#endif
+
+        ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
+        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
         return true;
     }
 
@@ -1874,6 +1900,9 @@ public:
         }
         ggml_cgraph * graph = stored_graphs_[device].graph;
         RDMA_LOG_DBG("[rdma_server] graph_recompute: device=%u\n", device);
+#ifdef GGML_RDMA_CUDA
+        fix_cross_device_refs(graph, device, stored_graphs_[device]);
+#endif
         ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
         return true;
@@ -1928,12 +1957,102 @@ public:
 
         // Recompute with updated graph
         ggml_cgraph * graph = stored_graphs_[device].graph;
+#ifdef GGML_RDMA_CUDA
+        fix_cross_device_refs(graph, device, stored_graphs_[device]);
+#endif
         ggml_status status = ggml_backend_graph_compute(backends_[device], graph);
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
         return true;
     }
 
 private:
+    struct stored_graph {
+        ggml_context_ptr ctx_ptr;
+        ggml_cgraph * graph;
+        std::unordered_map<uint64_t, ggml_tensor*> tensor_map;  // id -> tensor pointer for delta updates
+#ifdef GGML_RDMA_CUDA
+        std::vector<void *> cross_device_allocs;  // temporary GPU allocations for cross-device copies
+#endif
+    };
+
+#ifdef GGML_RDMA_CUDA
+    // Fix cross-device tensor access by copying data from foreign devices to target device via host memory.
+    // This is a safety net for cases where the scheduler doesn't properly split graphs across devices.
+    void fix_cross_device_refs(ggml_cgraph * graph, uint32_t device, stored_graph & sg) {
+        // Free previous cross-device allocations
+        if (!sg.cross_device_allocs.empty()) {
+            cudaSetDevice(device);
+            for (void * ptr : sg.cross_device_allocs) {
+                cudaFree(ptr);
+            }
+            sg.cross_device_allocs.clear();
+        }
+
+        std::unordered_map<void *, void *> copied_ptrs;
+        auto ensure_on_device = [&](ggml_tensor * t) {
+            if (!t || !t->buffer || !t->data) return;
+            auto bit = buffer_device_map_.find(t->buffer);
+            if (bit == buffer_device_map_.end() || bit->second == device) return;
+
+            auto cp = copied_ptrs.find(t->data);
+            if (cp != copied_ptrs.end()) {
+                t->data = cp->second;
+                return;
+            }
+
+            size_t nbytes = ggml_nbytes(t);
+            void * new_ptr = nullptr;
+            cudaSetDevice(device);
+            cudaError_t err = cudaMalloc(&new_ptr, nbytes);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] cudaMalloc failed (%zu B on dev %u): %s\n",
+                               nbytes, device, cudaGetErrorString(err));
+                return;
+            }
+
+            // Copy via host to avoid P2P topology issues
+            std::vector<uint8_t> host_buf(nbytes);
+            cudaSetDevice(bit->second);
+            err = cudaMemcpy(host_buf.data(), t->data, nbytes, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] D2H failed for %s (dev %u): %s\n",
+                               t->name, bit->second, cudaGetErrorString(err));
+                cudaSetDevice(device);
+                cudaFree(new_ptr);
+                return;
+            }
+            cudaSetDevice(device);
+            err = cudaMemcpy(new_ptr, host_buf.data(), nbytes, cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] H2D failed for %s (dev %u): %s\n",
+                               t->name, device, cudaGetErrorString(err));
+                cudaFree(new_ptr);
+                return;
+            }
+
+            RDMA_LOG_DBG("[rdma_server] Cross-device copy: %s (%zu B) dev %u -> dev %u\n",
+                         t->name, nbytes, bit->second, device);
+
+            sg.cross_device_allocs.push_back(new_ptr);
+            copied_ptrs[t->data] = new_ptr;
+            t->data = new_ptr;
+        };
+
+        for (int ni = 0; ni < graph->n_nodes; ni++) {
+            ggml_tensor * node = graph->nodes[ni];
+            if (!node) continue;
+            for (int si = 0; si < GGML_MAX_SRC; si++) {
+                ensure_on_device(node->src[si]);
+            }
+        }
+
+        if (!sg.cross_device_allocs.empty()) {
+            RDMA_LOG_DBG("[rdma_server] Fixed %zu cross-device tensors for device %u\n",
+                         sg.cross_device_allocs.size(), device);
+        }
+    }
+#endif // GGML_RDMA_CUDA
+
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rdma_tensor * tensor) {
         if (tensor->type >= GGML_TYPE_COUNT) {
             GGML_LOG_ERROR("[rdma_server] invalid tensor type: %u\n", tensor->type);
@@ -1951,6 +2070,8 @@ private:
         }
         result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
         if (result->buffer && buffers_.find(result->buffer) == buffers_.end()) {
+            GGML_LOG_ERROR("[rdma_server] WARNING: tensor '%s' buffer %p not found in buffers_, setting to nullptr (data=0x%" PRIx64 ")\n",
+                           tensor->name, (void*)result->buffer, tensor->data);
             result->buffer = nullptr;
         }
 
@@ -1960,6 +2081,9 @@ private:
             uint64_t buffer_size = (uint64_t)ggml_backend_buffer_get_size(result->buffer);
             GGML_ASSERT(tensor->data + tensor_size >= tensor->data);
             GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        } else if (tensor->data != 0) {
+            GGML_LOG_ERROR("[rdma_server] WARNING: tensor '%s' has no buffer but data=0x%" PRIx64 " (op=%d)\n",
+                           tensor->name, tensor->data, tensor->op);
         }
 
         result->op = (ggml_op)tensor->op;
@@ -2015,12 +2139,8 @@ private:
     const char * cache_dir_;
     std::unordered_set<ggml_backend_buffer_t> buffers_;
     std::unordered_map<ggml_backend_buffer_t, struct ibv_mr *> buffer_mrs_;
+    std::unordered_map<ggml_backend_buffer_t, uint32_t> buffer_device_map_;
 
-    struct stored_graph {
-        ggml_context_ptr ctx_ptr;
-        ggml_cgraph * graph;
-        std::unordered_map<uint64_t, ggml_tensor*> tensor_map;  // id -> tensor pointer for delta updates
-    };
     std::vector<stored_graph> stored_graphs_;
 };
 

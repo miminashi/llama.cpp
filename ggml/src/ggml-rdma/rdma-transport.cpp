@@ -356,56 +356,71 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
         return false;
     }
 
-    // If no MR provided, use inline data (for small messages) or internal buffer (for large)
-    struct ibv_sge sge = {};
-    struct ibv_send_wr wr = {};
-    struct ibv_send_wr * bad_wr = nullptr;
+    const uint8_t * src = static_cast<const uint8_t *>(data);
+    size_t remaining = size;
+    const size_t chunk_size = send_buffer_.size(); // Use internal buffer size as max chunk
 
-    if (mr) {
-        sge.addr = (uint64_t)data;
-        sge.length = size;
-        sge.lkey = mr->lkey;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-    } else if (size <= config_.max_inline) {
-        // Use inline data
-        sge.addr = (uint64_t)data;
-        sge.length = size;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags |= IBV_SEND_INLINE;
-    } else if (send_buffer_.size() > 0 && size <= send_buffer_.size() && send_mr_) {
-        // Use internal send buffer for larger messages
-        std::memcpy(send_buffer_.data(), data, size);
-        sge.addr = (uint64_t)send_buffer_.data();
-        sge.length = size;
-        sge.lkey = send_mr_->lkey;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        RDMA_LOG_DBG("[rdma_connection] Using internal send buffer for %zu bytes\n", size);
-    } else {
-        GGML_LOG_ERROR("[rdma_connection] Message too large for inline send without MR\n");
-        GGML_LOG_ERROR("[rdma_connection]   size=%zu, max_inline=%u, send_buffer_.size()=%zu, send_mr_=%p\n",
-                       size, config_.max_inline, send_buffer_.size(), (void*)send_mr_);
-        return false;
+    while (remaining > 0) {
+        size_t send_size = remaining;
+
+        struct ibv_sge sge = {};
+        struct ibv_send_wr wr = {};
+        struct ibv_send_wr * bad_wr = nullptr;
+
+        if (mr) {
+            sge.addr = (uint64_t)src;
+            sge.length = send_size;
+            sge.lkey = mr->lkey;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+        } else if (send_size <= config_.max_inline) {
+            // Use inline data
+            sge.addr = (uint64_t)src;
+            sge.length = send_size;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.send_flags |= IBV_SEND_INLINE;
+        } else if (chunk_size > 0 && send_mr_) {
+            // Use internal send buffer, chunk if needed
+            if (send_size > chunk_size) {
+                send_size = chunk_size;
+            }
+            std::memcpy(send_buffer_.data(), src, send_size);
+            sge.addr = (uint64_t)send_buffer_.data();
+            sge.length = send_size;
+            sge.lkey = send_mr_->lkey;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            if (send_size < remaining) {
+                RDMA_LOG_DBG("[rdma_connection] Chunked send: %zu/%zu bytes\n", send_size, remaining);
+            }
+        } else {
+            GGML_LOG_ERROR("[rdma_connection] Message too large for inline send without MR\n");
+            GGML_LOG_ERROR("[rdma_connection]   size=%zu, max_inline=%u, send_buffer_.size()=%zu, send_mr_=%p\n",
+                           send_size, config_.max_inline, send_buffer_.size(), (void*)send_mr_);
+            return false;
+        }
+
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags |= IBV_SEND_SIGNALED;
+
+        if (ibv_post_send(qp_, &wr, &bad_wr) != 0) {
+            GGML_LOG_ERROR("[rdma_connection] Failed to post send: %s\n", strerror(errno));
+            return false;
+        }
+
+        // Wait for completion
+        if (!wait_for_completion(30000)) {
+            GGML_LOG_ERROR("[rdma_connection] Send completion timeout\n");
+            return false;
+        }
+
+        stats_.bytes_sent += send_size;
+        stats_.send_ops++;
+        src += send_size;
+        remaining -= send_size;
     }
 
-    wr.opcode = IBV_WR_SEND;
-    wr.send_flags |= IBV_SEND_SIGNALED;
-
-    if (ibv_post_send(qp_, &wr, &bad_wr) != 0) {
-        GGML_LOG_ERROR("[rdma_connection] Failed to post send: %s\n", strerror(errno));
-        return false;
-    }
-
-    // Wait for completion
-    if (!wait_for_completion(30000)) {
-        GGML_LOG_ERROR("[rdma_connection] Send completion timeout\n");
-        return false;
-    }
-
-    stats_.bytes_sent += size;
-    stats_.send_ops++;
     RDMA_LOG_DBG("[rdma_connection] Sent %zu bytes\n", size);
     return true;
 }
@@ -415,39 +430,53 @@ bool rdma_connection::recv(void * data, size_t size, struct ibv_mr * mr) {
         return false;
     }
 
-    void * recv_addr = data;
-    struct ibv_mr * recv_mr = mr;
+    uint8_t * dst = static_cast<uint8_t *>(data);
+    size_t remaining = size;
+    const size_t chunk_size = recv_buffer_.size(); // Use internal buffer size as max chunk
 
-    // If no MR provided, use internal receive buffer
-    if (!mr) {
-        if (recv_buffer_.size() > 0 && size <= recv_buffer_.size() && recv_mr_) {
+    while (remaining > 0) {
+        size_t recv_size = remaining;
+        void * recv_addr = dst;
+        struct ibv_mr * recv_mr_use = mr;
+
+        if (mr) {
+            // External MR: receive directly (no chunking needed, caller manages buffer)
+            recv_size = remaining;
+        } else if (chunk_size > 0 && recv_mr_) {
+            // Use internal receive buffer, chunk if needed
+            if (recv_size > chunk_size) {
+                recv_size = chunk_size;
+            }
             recv_addr = recv_buffer_.data();
-            recv_mr = recv_mr_;
+            recv_mr_use = recv_mr_;
         } else {
             GGML_LOG_ERROR("[rdma_connection] No MR provided and message too large (%zu bytes) for internal buffer (%zu bytes)\n",
-                           size, recv_buffer_.size());
+                           recv_size, recv_buffer_.size());
             return false;
         }
+
+        // Post receive
+        if (!post_recv(recv_addr, recv_size, recv_mr_use, 0)) {
+            return false;
+        }
+
+        // Wait for completion
+        if (!wait_for_completion(30000)) {
+            GGML_LOG_ERROR("[rdma_connection] Receive completion timeout\n");
+            return false;
+        }
+
+        // Copy data from internal buffer if needed
+        if (!mr && recv_addr != dst) {
+            std::memcpy(dst, recv_buffer_.data(), recv_size);
+        }
+
+        stats_.bytes_received += recv_size;
+        stats_.recv_ops++;
+        dst += recv_size;
+        remaining -= recv_size;
     }
 
-    // Post receive
-    if (!post_recv(recv_addr, size, recv_mr, 0)) {
-        return false;
-    }
-
-    // Wait for completion
-    if (!wait_for_completion(30000)) {
-        GGML_LOG_ERROR("[rdma_connection] Receive completion timeout\n");
-        return false;
-    }
-
-    // Copy data from internal buffer if needed
-    if (!mr && recv_addr != data) {
-        std::memcpy(data, recv_buffer_.data(), size);
-    }
-
-    stats_.bytes_received += size;
-    stats_.recv_ops++;
     RDMA_LOG_DBG("[rdma_connection] Received %zu bytes\n", size);
     return true;
 }
