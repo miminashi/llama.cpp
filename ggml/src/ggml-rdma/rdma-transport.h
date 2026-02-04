@@ -28,7 +28,7 @@ struct rdma_config {
     uint32_t timeout        = 14;       // Connection timeout (4.096us * 2^timeout)
     uint32_t retry_count    = 7;        // Number of retries
     uint32_t rnr_retry      = 7;        // Receiver not ready retry
-    size_t   recv_buf_size  = 64 * 1024; // Receive buffer size for control messages
+    size_t   recv_buf_size  = 1024 * 1024; // Receive buffer size for control messages (1MB)
 };
 
 // Remote memory region information for RDMA operations

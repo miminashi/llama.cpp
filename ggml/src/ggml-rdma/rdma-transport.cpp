@@ -2,11 +2,11 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 
+#include <chrono>
 #include <cstring>
 #include <cerrno>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -251,23 +251,10 @@ bool rdma_connection::setup_qp(const rdma_config & config) {
         return false;
     }
 
-    // Create completion channel
-    comp_channel_ = ibv_create_comp_channel(cm_id_->verbs);
-    if (!comp_channel_) {
-        GGML_LOG_ERROR("[rdma_connection] Failed to create completion channel: %s\n", strerror(errno));
-        return false;
-    }
-
-    // Create completion queue
-    cq_ = ibv_create_cq(cm_id_->verbs, config.cq_size, nullptr, comp_channel_, 0);
+    // Create completion queue (no completion channel - using busy polling)
+    cq_ = ibv_create_cq(cm_id_->verbs, config.cq_size, nullptr, nullptr, 0);
     if (!cq_) {
         GGML_LOG_ERROR("[rdma_connection] Failed to create CQ: %s\n", strerror(errno));
-        return false;
-    }
-
-    // Request notification on CQ
-    if (ibv_req_notify_cq(cq_, 0) != 0) {
-        GGML_LOG_ERROR("[rdma_connection] Failed to request CQ notification: %s\n", strerror(errno));
         return false;
     }
 
@@ -599,51 +586,15 @@ int rdma_connection::poll_cq(int max_entries) {
 }
 
 bool rdma_connection::wait_for_completion(int timeout_ms) {
-    if (!comp_channel_ || !cq_) {
+    if (!cq_) {
         return false;
     }
 
-    // Set up poll
-    struct pollfd pfd = {};
-    pfd.fd = comp_channel_->fd;
-    pfd.events = POLLIN;
-
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret < 0) {
-        GGML_LOG_ERROR("[rdma_connection] Poll failed: %s\n", strerror(errno));
-        return false;
-    }
-    if (ret == 0) {
-        return false; // Timeout
-    }
-
-    // Get CQ event
-    struct ibv_cq * ev_cq = nullptr;
-    void * ev_ctx = nullptr;
-    if (ibv_get_cq_event(comp_channel_, &ev_cq, &ev_ctx) != 0) {
-        GGML_LOG_ERROR("[rdma_connection] Failed to get CQ event: %s\n", strerror(errno));
-        return false;
-    }
-
-    // Acknowledge and re-arm
-    ibv_ack_cq_events(ev_cq, 1);
-    if (ibv_req_notify_cq(cq_, 0) != 0) {
-        GGML_LOG_ERROR("[rdma_connection] Failed to re-arm CQ: %s\n", strerror(errno));
-        return false;
-    }
-
-    // Poll for completion with retry logic
-    // CQ event may arrive before WC is visible in poll_cq(), so retry multiple times
     struct ibv_wc wc = {};
-    const int max_poll_retries = 100;
-    const int poll_retry_delay_us = 100; // 100 microseconds
+    auto start = std::chrono::steady_clock::now();
 
-    for (int retry = 0; retry < max_poll_retries; retry++) {
+    while (true) {
         int n = ibv_poll_cq(cq_, 1, &wc);
-        if (n < 0) {
-            GGML_LOG_ERROR("[rdma_connection] Failed to poll CQ: %s\n", strerror(errno));
-            return false;
-        }
         if (n > 0) {
             if (wc.status != IBV_WC_SUCCESS) {
                 GGML_LOG_ERROR("[rdma_connection] Work completion error: %s\n", ibv_wc_status_str(wc.status));
@@ -651,12 +602,18 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
             }
             return true;
         }
-        // WC not yet available, wait briefly and retry
-        usleep(poll_retry_delay_us);
+        if (n < 0) {
+            GGML_LOG_ERROR("[rdma_connection] Failed to poll CQ: %s\n", strerror(errno));
+            return false;
+        }
+        if (timeout_ms >= 0) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed > timeout_ms) {
+                return false;
+            }
+        }
     }
-
-    GGML_LOG_ERROR("[rdma_connection] poll_cq returned 0 after %d retries (CQ event received but no WC)\n", max_poll_retries);
-    return false;
 }
 
 remote_memory_info rdma_connection::get_local_mr_info(struct ibv_mr * mr) const {

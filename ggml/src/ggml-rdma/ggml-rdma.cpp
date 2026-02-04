@@ -290,23 +290,26 @@ static std::shared_ptr<rdma_connection> get_connection(const std::string & endpo
 // Message sending helpers
 
 // Internal: send command and input data only (no response handling)
+// Protocol: send [cmd(1B) | input_size(8B)] as one message, then [input_data(NB)] as another.
+// Reduces 3 sends to 2 (or 1 if no data).
 static bool send_rdma_cmd_raw(rdma_connection * conn, rdma_cmd cmd, const void * input, size_t input_size,
                               struct ibv_mr * send_mr) {
-    // Protocol: | cmd (1 byte) | input_size (8 bytes) | input_data |
-    // Send each part separately to match server's receive pattern
-    // Note: send_mr is only valid for input data, not for header fields
-    uint8_t cmd_byte = static_cast<uint8_t>(cmd);
-    if (!conn->send(&cmd_byte, 1, nullptr)) {
-        return false;
-    }
+    (void)send_mr; // No longer used - internal buffer handles all sizes
 
+    // Send header: [cmd(1B) | size(8B)]
+    const size_t header_size = 1 + sizeof(uint64_t);
+    uint8_t header[1 + sizeof(uint64_t)];
+    header[0] = static_cast<uint8_t>(cmd);
     uint64_t size = input_size;
-    if (!conn->send(&size, sizeof(size), nullptr)) {
+    std::memcpy(header + 1, &size, sizeof(size));
+
+    if (!conn->send(header, header_size, nullptr)) {
         return false;
     }
 
+    // Send data if any
     if (input_size > 0) {
-        if (!conn->send(input, input_size, send_mr)) {
+        if (!conn->send(input, input_size, nullptr)) {
             return false;
         }
     }
@@ -336,19 +339,26 @@ static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * inp
     return true;
 }
 
+// Receive response: | output_size (8 bytes) | output_data (N bytes) |
+// All parts received in a single RDMA RECV to minimize completions.
 static bool recv_rdma_rsp(rdma_connection * conn, void * output, size_t output_size,
                           struct ibv_mr * recv_mr) {
-    // Response: | output_size (8 bytes) | output_data |
-    uint64_t size = 0;
-    if (!conn->recv(&size, sizeof(size), recv_mr)) {
+    (void)recv_mr; // No longer used - internal buffer handles all sizes
+
+    const size_t total_size = sizeof(uint64_t) + output_size;
+    std::vector<uint8_t> buf(total_size);
+    if (!conn->recv(buf.data(), total_size, nullptr)) {
         return false;
     }
+
+    uint64_t size = 0;
+    std::memcpy(&size, buf.data(), sizeof(size));
     if (size != output_size) {
         GGML_LOG_ERROR("[rdma] Response size mismatch: expected %zu, got %" PRIu64 "\n", output_size, size);
         return false;
     }
     if (output_size > 0) {
-        return conn->recv(output, output_size, recv_mr);
+        std::memcpy(output, buf.data() + sizeof(uint64_t), output_size);
     }
     return true;
 }
@@ -839,22 +849,7 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         std::vector<uint8_t> input;
         serialize_graph(ctx->device, cgraph, input);
 
-        // Register temporary MR for large graph data (> 64KB)
-        static const size_t RDMA_SEND_BUF_SIZE = 64 * 1024;
-        struct ibv_mr * send_mr = nullptr;
-        if (input.size() > RDMA_SEND_BUF_SIZE) {
-            send_mr = ctx->conn->register_memory(input.data(), input.size(), IBV_ACCESS_LOCAL_WRITE);
-            if (!send_mr) {
-                GGML_LOG_ERROR("[rdma] Failed to register MR for graph data (size=%zu)\n", input.size());
-                return GGML_STATUS_FAILED;
-            }
-        }
-
-        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), send_mr);
-
-        if (send_mr) {
-            ctx->conn->deregister_memory(send_mr);
-        }
+        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr);
 
         RDMA_STATUS_ASSERT(status);
     }
@@ -1843,37 +1838,47 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
         // In production, this should be multi-threaded
         rdma_server server(backends, cache_dir);
 
+        // Helper: send unified response [rsp_size(8B) | rsp_data(NB)] in a single SEND
+        auto send_rsp = [&](const void * data, size_t data_size) -> bool {
+            const size_t total = sizeof(uint64_t) + data_size;
+            std::vector<uint8_t> buf(total);
+            uint64_t sz = data_size;
+            std::memcpy(buf.data(), &sz, sizeof(sz));
+            if (data_size > 0) {
+                std::memcpy(buf.data() + sizeof(uint64_t), data, data_size);
+            }
+            return conn->send(buf.data(), total, nullptr);
+        };
+
+        // Helper: send response with no data (rsp_size = 0)
+        auto send_rsp_empty = [&]() -> bool {
+            uint64_t sz = 0;
+            return conn->send(&sz, sizeof(sz), nullptr);
+        };
+
         // Process commands
-        uint8_t cmd;
-        while (conn->recv(&cmd, 1, nullptr)) {
+        // Receive: [cmd(1B) | msg_size(8B)] in one RECV, then [msg_data(NB)] in another.
+        // Reduces 3 recvs to 2 (or 1 if no data).
+        const size_t cmd_header_size = 1 + sizeof(uint64_t);
+        uint8_t header_buf[1 + sizeof(uint64_t)];
+        while (true) {
+            if (!conn->recv(header_buf, cmd_header_size, nullptr)) {
+                break;
+            }
+
+            uint8_t cmd = header_buf[0];
             if (cmd >= RDMA_CMD_COUNT) {
                 fprintf(stderr, "Unknown command: %d\n", cmd);
                 break;
             }
 
-            // Read message size
-            uint64_t msg_size;
-            if (!conn->recv(&msg_size, sizeof(msg_size), nullptr)) {
-                break;
-            }
+            uint64_t msg_size = 0;
+            std::memcpy(&msg_size, header_buf + 1, sizeof(msg_size));
 
-            // Read message data
+            // Read message data if any
             std::vector<uint8_t> msg_data(msg_size);
             if (msg_size > 0) {
-                static const size_t RDMA_RECV_BUF_SIZE = 64 * 1024;
-                struct ibv_mr * recv_mr = nullptr;
-                if (msg_size > RDMA_RECV_BUF_SIZE) {
-                    recv_mr = conn->register_memory(msg_data.data(), msg_size, IBV_ACCESS_LOCAL_WRITE);
-                    if (!recv_mr) {
-                        fprintf(stderr, "[rdma-server] Failed to register MR for recv (size=%zu)\n", (size_t)msg_size);
-                        break;
-                    }
-                }
-                bool ok = conn->recv(msg_data.data(), msg_size, recv_mr);
-                if (recv_mr) {
-                    conn->deregister_memory(recv_mr);
-                }
-                if (!ok) {
+                if (!conn->recv(msg_data.data(), msg_size, nullptr)) {
                     break;
                 }
             }
@@ -1882,17 +1887,13 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                 case RDMA_CMD_HELLO: {
                     rdma_msg_hello_rsp response;
                     server.hello(response);
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_DEVICE_COUNT: {
                     rdma_msg_device_count_rsp response;
                     response.device_count = backends.size();
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_ALLOC_BUFFER: {
@@ -1900,17 +1901,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_alloc_buffer_rsp response;
                     server.alloc_buffer(request, response, conn.get());
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_FREE_BUFFER: {
                     rdma_msg_free_buffer_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     server.free_buffer(request, conn.get());
-                    uint64_t rsp_size = 0;
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                    send_rsp_empty();
                     break;
                 }
                 case RDMA_CMD_GET_ALIGNMENT: {
@@ -1918,9 +1916,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_alignment_rsp response;
                     server.get_alignment(request, response);
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_GET_MAX_SIZE: {
@@ -1928,9 +1924,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_max_size_rsp response;
                     server.get_max_size(request, response);
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_BUFFER_GET_BASE: {
@@ -1938,17 +1932,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_buffer_get_base_rsp response;
                     server.buffer_get_base(request, response);
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_BUFFER_CLEAR: {
                     rdma_msg_buffer_clear_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     server.buffer_clear(request);
-                    uint64_t rsp_size = 0;
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                    send_rsp_empty();
                     break;
                 }
                 case RDMA_CMD_GET_DEVICE_MEMORY: {
@@ -1956,17 +1947,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_device_memory_rsp response;
                     server.get_device_memory(request, response);
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_SET_TENSOR: {
                     if (!server.set_tensor(msg_data)) {
                         fprintf(stderr, "set_tensor failed\n");
                     }
-                    uint64_t rsp_size = 0;
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                    send_rsp_empty();
                     break;
                 }
                 case RDMA_CMD_GET_TENSOR: {
@@ -1975,14 +1963,9 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     std::vector<uint8_t> response;
                     if (!server.get_tensor(request, response)) {
                         fprintf(stderr, "get_tensor failed\n");
-                        uint64_t rsp_size = 0;
-                        conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                        send_rsp_empty();
                     } else {
-                        uint64_t rsp_size = response.size();
-                        conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                        if (rsp_size > 0) {
-                            conn->send(response.data(), response.size(), nullptr);
-                        }
+                        send_rsp(response.data(), response.size());
                     }
                     break;
                 }
@@ -1994,9 +1977,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                         fprintf(stderr, "copy_tensor failed\n");
                         response.result = 0;
                     }
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_INIT_TENSOR: {
@@ -2005,8 +1986,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     if (!server.init_tensor(request)) {
                         fprintf(stderr, "init_tensor failed\n");
                     }
-                    uint64_t rsp_size = 0;
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                    send_rsp_empty();
                     break;
                 }
                 case RDMA_CMD_GET_ALLOC_SIZE: {
@@ -2017,17 +1997,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                         fprintf(stderr, "get_alloc_size failed\n");
                         response.alloc_size = 0;
                     }
-                    uint64_t rsp_size = sizeof(response);
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
-                    conn->send(&response, sizeof(response), nullptr);
+                    send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_GRAPH_COMPUTE: {
                     if (!server.graph_compute(msg_data)) {
                         fprintf(stderr, "graph_compute failed\n");
                     }
-                    uint64_t rsp_size = 0;
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                    send_rsp_empty();
                     break;
                 }
                 case RDMA_CMD_GRAPH_RECOMPUTE: {
@@ -2036,8 +2013,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     if (!server.graph_recompute(request)) {
                         fprintf(stderr, "graph_recompute failed\n");
                     }
-                    uint64_t rsp_size = 0;
-                    conn->send(&rsp_size, sizeof(rsp_size), nullptr);
+                    send_rsp_empty();
                     break;
                 }
                 default:
