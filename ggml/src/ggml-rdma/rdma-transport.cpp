@@ -190,6 +190,21 @@ bool rdma_connection::accept(struct rdma_cm_id * cm_id, const rdma_config & conf
     }
 
     connected_ = true;
+
+    // Set min_rnr_timer to minimum value (1 = 0.01ms) to avoid 655ms RNR NAK delays.
+    // Default min_rnr_timer (0 = 655.36ms) causes ~2 second spikes when sender
+    // posts send before receiver posts recv (RNR condition).
+    {
+        struct ibv_qp_attr attr = {};
+        attr.min_rnr_timer = 1;  // 0.01ms (value 1) instead of 655.36ms (value 0)
+        if (ibv_modify_qp(qp_, &attr, IBV_QP_MIN_RNR_TIMER) != 0) {
+            GGML_LOG_ERROR("[rdma_connection] Failed to set min_rnr_timer: %s\n", strerror(errno));
+            // Non-fatal: continue with default timer
+        } else {
+            RDMA_LOG_DBG("[rdma_connection] Set min_rnr_timer=1 (0.01ms)\n");
+        }
+    }
+
     RDMA_LOG_DBG("[rdma_connection] Accepted connection from %s\n", endpoint_.c_str());
     return true;
 }
@@ -322,6 +337,17 @@ bool rdma_connection::connect_qp() {
         return false;
     }
     rdma_ack_cm_event(event);
+
+    // Set min_rnr_timer to minimum value on client side too
+    {
+        struct ibv_qp_attr attr = {};
+        attr.min_rnr_timer = 1;  // 0.01ms
+        if (ibv_modify_qp(qp_, &attr, IBV_QP_MIN_RNR_TIMER) != 0) {
+            GGML_LOG_ERROR("[rdma_connection] Failed to set min_rnr_timer: %s\n", strerror(errno));
+        } else {
+            RDMA_LOG_DBG("[rdma_connection] Set min_rnr_timer=1 (0.01ms)\n");
+        }
+    }
 
     return true;
 }
@@ -627,6 +653,7 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
 
     struct ibv_wc wc = {};
     auto start = std::chrono::steady_clock::now();
+    int poll_count = 0;
 
     while (true) {
         int n = ibv_poll_cq(cq_, 1, &wc);
@@ -643,6 +670,12 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
             GGML_LOG_ERROR("[rdma_connection] Failed to poll CQ: %s\n", strerror(errno));
             return false;
         }
+        // Experiment 2: DISABLED - caused 2s delays
+        // First 100 polls are busy (for low-latency completions), then sleep 10us
+        // if (++poll_count > 100) {
+        //     usleep(10);
+        // }
+        (void)poll_count;
         if (timeout_ms >= 0) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
