@@ -1242,10 +1242,20 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             }
             memcpy(dest, &ctx->device, sizeof(ctx->device));
 
+            uint64_t t_send = RDMA_PROFILE ? profile_now_us() : 0;
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE,
                                         input.data(), input.size(), nullptr);
+            uint64_t send_us = RDMA_PROFILE ? profile_now_us() - t_send : 0;
             RDMA_STATUS_ASSERT(status);
-            if (RDMA_PROFILE) g_profile.graph_compute_recompute++;
+            if (RDMA_PROFILE) {
+                g_profile.graph_compute_recompute++;
+                uint64_t calls = g_profile.graph_compute_calls.load() + 1;
+                if (calls <= 20 || calls % g_profile_print_interval.load() == 0) {
+                    uint64_t pre_send = t_send - t0;
+                    fprintf(stderr, "[client detail] recompute: pre_send=%.2f ms, send_cmd=%.2f ms\n",
+                            pre_send/1000.0, send_us/1000.0);
+                }
+            }
         } else {
             // Delta updates — combine flush + compute_update in one round-trip
             // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) | n_updates(4B) | updates(M*100B) |
@@ -1276,8 +1286,16 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         }
 
         // Update snapshots for next diff
+        uint64_t t_snap = RDMA_PROFILE ? profile_now_us() : 0;
         ctx->gc.build_snapshot_map(cgraph);
         ctx->gc.add(cgraph);
+        if (RDMA_PROFILE) {
+            uint64_t snap_us = profile_now_us() - t_snap;
+            uint64_t calls = g_profile.graph_compute_calls.load() + 1;
+            if (calls <= 20 || calls % g_profile_print_interval.load() == 0) {
+                fprintf(stderr, "[client detail] snapshot_update: %.2f ms\n", snap_us/1000.0);
+            }
+        }
     } else {
         // Full graph send (first time or structure changed)
         // Flush separately if needed (full graph send is rare)
@@ -1304,11 +1322,15 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         g_profile.graph_compute_calls++;
         g_profile.graph_compute_us += elapsed;
 
-        // Periodically print profile summary
         uint64_t calls = g_profile.graph_compute_calls.load();
         uint64_t interval = g_profile_print_interval.load();
         if (interval > 0 && calls % interval == 0) {
             g_profile.print_summary();
+        }
+        // Print every call's timing during first 20 calls and then every 10th
+        if (calls <= 20 || (interval > 0 && calls % interval == 0)) {
+            fprintf(stderr, "[client profile] graph_compute #%lu: %.2f ms (reuse=%d, n_flush=%u, n_nodes=%d)\n",
+                    (unsigned long)calls, elapsed/1000.0, reuse ? 1 : 0, n_flush, cgraph->n_nodes);
         }
     }
 
