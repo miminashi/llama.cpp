@@ -605,15 +605,26 @@ static bool send_rdma_cmd_raw(rdma_connection * conn, rdma_cmd cmd, const void *
     uint64_t size = input_size;
     std::memcpy(header + 1, &size, sizeof(size));
 
+    uint64_t t_hdr = RDMA_PROFILE ? profile_now_us() : 0;
     if (!conn->send(header, header_size, nullptr)) {
         return false;
     }
+    uint64_t hdr_us = RDMA_PROFILE ? profile_now_us() - t_hdr : 0;
 
     // Send data if any
+    uint64_t data_us = 0;
     if (input_size > 0) {
+        uint64_t t_data = RDMA_PROFILE ? profile_now_us() : 0;
         if (!conn->send(input, input_size, nullptr)) {
             return false;
         }
+        data_us = RDMA_PROFILE ? profile_now_us() - t_data : 0;
+    }
+
+    // Log detailed breakdown if significant delay (>100ms total)
+    if (RDMA_PROFILE && (hdr_us + data_us) > 100000) {
+        fprintf(stderr, "[client send_raw] cmd=%d: header=%.2f ms, data=%.2f ms (size=%zu)\n",
+                (int)cmd, hdr_us/1000.0, data_us/1000.0, input_size);
     }
 
     return true;
@@ -621,26 +632,35 @@ static bool send_rdma_cmd_raw(rdma_connection * conn, rdma_cmd cmd, const void *
 
 // Send command with no response data expected (server still sends rsp_size=0)
 // Thread-safe: protects the entire send+recv sequence with op_mutex_
+// Returns timing info via optional out parameters (in microseconds)
 static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * input, size_t input_size,
-                          struct ibv_mr * send_mr) {
+                          struct ibv_mr * send_mr, uint64_t * out_send_us = nullptr, uint64_t * out_recv_us = nullptr) {
     std::lock_guard<std::recursive_mutex> op_lock(conn->op_mutex_);
     RDMA_LOG_DBG("[send_rdma_cmd] cmd=%d, input_size=%zu (locked)\n", (int)cmd, input_size);
 
+    uint64_t t_send = RDMA_PROFILE ? profile_now_us() : 0;
     if (!send_rdma_cmd_raw(conn, cmd, input, input_size, send_mr)) {
         return false;
     }
+    uint64_t send_us = RDMA_PROFILE ? profile_now_us() - t_send : 0;
 
     // Server always sends rsp_size (8 bytes), even for commands with no response data.
     // We must receive it to keep the protocol synchronized.
+    uint64_t t_recv = RDMA_PROFILE ? profile_now_us() : 0;
     uint64_t rsp_size = 0;
     if (!conn->recv(&rsp_size, sizeof(rsp_size), nullptr)) {
         return false;
     }
+    uint64_t recv_us = RDMA_PROFILE ? profile_now_us() - t_recv : 0;
+
     // rsp_size should be 0 for commands without response data
     if (rsp_size != 0) {
         GGML_LOG_ERROR("[rdma] Unexpected response size for no-response command: %" PRIu64 "\n", rsp_size);
         return false;
     }
+
+    if (out_send_us) *out_send_us = send_us;
+    if (out_recv_us) *out_recv_us = recv_us;
 
     return true;
 }
@@ -1242,18 +1262,23 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             }
             memcpy(dest, &ctx->device, sizeof(ctx->device));
 
-            uint64_t t_send = RDMA_PROFILE ? profile_now_us() : 0;
+            uint64_t send_us = 0, recv_us = 0;
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE,
-                                        input.data(), input.size(), nullptr);
-            uint64_t send_us = RDMA_PROFILE ? profile_now_us() - t_send : 0;
+                                        input.data(), input.size(), nullptr,
+                                        RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr);
             RDMA_STATUS_ASSERT(status);
             if (RDMA_PROFILE) {
                 g_profile.graph_compute_recompute++;
                 uint64_t calls = g_profile.graph_compute_calls.load() + 1;
-                if (calls <= 20 || calls % g_profile_print_interval.load() == 0) {
-                    uint64_t pre_send = t_send - t0;
-                    fprintf(stderr, "[client detail] recompute: pre_send=%.2f ms, send_cmd=%.2f ms\n",
-                            pre_send/1000.0, send_us/1000.0);
+                uint64_t total_cmd = send_us + recv_us;
+                // Check for spike (> 500ms)
+                if (total_cmd > 500000) {
+                    fprintf(stderr, "[client SPIKE] recompute #%lu: send=%.2f ms, recv=%.2f ms (TOTAL=%.2f ms)\n",
+                            (unsigned long)calls, send_us/1000.0, recv_us/1000.0, total_cmd/1000.0);
+                } else if (calls <= 20 || calls % g_profile_print_interval.load() == 0) {
+                    uint64_t pre_send = profile_now_us() - t0 - send_us - recv_us;
+                    fprintf(stderr, "[client detail] recompute: pre_send=%.2f ms, send=%.2f ms, recv=%.2f ms\n",
+                            pre_send/1000.0, send_us/1000.0, recv_us/1000.0);
                 }
             }
         } else {
@@ -1279,10 +1304,21 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             RDMA_LOG_DBG("[rdma] flush_and_compute_update: %u flushes + %u updates, %zu bytes\n",
                          n_flush, n_updates, input_size);
 
+            uint64_t upd_send_us = 0, upd_recv_us = 0;
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE,
-                                        input.data(), input.size(), nullptr);
+                                        input.data(), input.size(), nullptr,
+                                        RDMA_PROFILE ? &upd_send_us : nullptr, RDMA_PROFILE ? &upd_recv_us : nullptr);
             RDMA_STATUS_ASSERT(status);
-            if (RDMA_PROFILE) g_profile.graph_compute_update++;
+            if (RDMA_PROFILE) {
+                g_profile.graph_compute_update++;
+                uint64_t total_cmd = upd_send_us + upd_recv_us;
+                uint64_t calls = g_profile.graph_compute_calls.load() + 1;
+                // Check for spike (> 500ms)
+                if (total_cmd > 500000) {
+                    fprintf(stderr, "[client SPIKE] update #%lu: send=%.2f ms, recv=%.2f ms (TOTAL=%.2f ms)\n",
+                            (unsigned long)calls, upd_send_us/1000.0, upd_recv_us/1000.0, total_cmd/1000.0);
+                }
+            }
         }
 
         // Update snapshots for next diff
@@ -1305,11 +1341,23 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             RDMA_STATUS_ASSERT(flush_ok);
         }
 
+        // Detailed profiling for full graph send (experiment 1+4)
+        uint64_t t_serialize = RDMA_PROFILE ? profile_now_us() : 0;
         std::vector<uint8_t> input;
         serialize_graph(ctx->device, cgraph, input);
+        uint64_t serialize_us = RDMA_PROFILE ? profile_now_us() - t_serialize : 0;
 
-        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr);
+        uint64_t send_us = 0, recv_us = 0;
+        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr,
+                                     RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr);
         RDMA_STATUS_ASSERT(status);
+
+        if (RDMA_PROFILE) {
+            uint64_t calls = g_profile.graph_compute_calls.load() + 1;
+            // Always print full graph send details (they are rare and important)
+            fprintf(stderr, "[client FULL_GRAPH] #%lu: serialize=%.2f ms (size=%zu), send=%.2f ms, recv=%.2f ms, n_nodes=%d\n",
+                    (unsigned long)calls, serialize_us/1000.0, input.size(), send_us/1000.0, recv_us/1000.0, cgraph->n_nodes);
+        }
 
         // Save snapshots for future diffs
         ctx->gc.build_snapshot_map(cgraph);
