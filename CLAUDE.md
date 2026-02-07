@@ -61,11 +61,12 @@ llama-bench -m /tmp/gpt-oss-120b/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf \
 ### ステップ間の依存関係
 
 ```
-Step 1 (完了) → Step 2 (完了) → Step 3 (完了) → Step 4 (完了) → Step 5 (GLM4.7) ★次
+Step 1 (完了) → Step 2 (完了) → Step 3 (完了) → Step 4 (完了) → Step 5 (11GPU事前検証完了, 16GPU待ち)
 ```
 
-- Step 5 が次のステップ (GLM4.7 Q4 を 16台 P100 で動作させる)
-- 16台のP100に依存するが、11台での事前検証は先行可能
+- Step 5 の 11GPU 事前検証は完了 (GLM-4.7 IQ2_M で pp=6.4, tg=6.8 t/s)
+- 16GPU への拡張は GPU 追加待ち
+- GLM-4.7 Q4 (IQ2_M より大きい) は 16GPU が必要な可能性
 
 ### モデル分割方式
 
@@ -176,34 +177,67 @@ Step 1 (完了) → Step 2 (完了) → Step 3 (完了) → Step 4 (完了) → 
 GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 モデルはunslothの量子化モデル (Hugging Face) を使用予定。
 
-### タスク
+### 達成状況 (11GPU 事前検証)
 
-1. **モデル準備と事前検証**
-   - unsloth GLM4.7 Q4のダウンロードとサイズ確認
-   - 11GPUでの動作確認 (GPU追加前に先行テスト可能)
-   - `-sm layer` によるレイヤー分割でVRAM分配計画を策定 (P100 16GB × n台)
-   - ※ row splitはP100 (NVLinkなし) では性能が出ないため不使用
+#### 達成済み
+- **GLM-4.7 IQ2_M が 11GPU (7C+4R) で安定動作** — 正常な推論出力を確認
+- **GPUDirect RDMA タイムアウト解消** — GDR バジェットシステム (`GGML_RDMA_GDR_BUDGET_GB`) で RNIC MTT キャッシュオーバーフローを回避
+- **Multi-RDMA デバイス出力破損修正** — `cpy_tensor` 無効化で `get_tensor+set_tensor` フォールバック
+- **get_tensor stale data 修正** — per-buffer `mr_is_gdr` フラグで GDR MR のみ RDMA Read 許可
+- **mmap + RDMA Write 修正** — 4GB per-buffer サイズ制限 + Send/Recv フォールバック
 
-2. **ハードウェアスケーリング** (GPU追加後)
-   - 16GPU (8+8等) への拡張と接続確認
-   - 全GPUでのRDMA接続確立テスト
+#### 達成数値 (GLM-4.7 IQ2_M, 7 CUDA + 4 RDMA, 11GPU)
 
-3. **大規模分散推論の最適化**
-   - 16GPUでのグラフスケジューリング最適化
-   - ノード間通信パターンの最適化
-   - メモリ使用量の最適化 (P100 16GBの制約下)
+| バックエンド | Prompt (t/s) | Generation (t/s) |
+|-------------|:------------:|:----------------:|
+| **RDMA (GDR budget 12GB)** | **6.4** | **6.8** |
+| RDMA (GDR 無効) | 6.4 | 6.0 |
+| RPC (TCP) | 5.4 | 7.5 |
+
+- RDMA は Prompt 処理で RPC 比 **+19%** (RDMA Write ゼロコピーの効果)
+- RPC は Generation で RDMA 比 **+10%** (デバイスごとの独立ソケットによるコマンド並列化)
+- GDR 有効で Generation が GDR 無効比 **+13%** 改善
+
+### 残タスク
+
+1. **16GPU への拡張** (GPU 追加後)
+   - 16GPU (8+8) への拡張と全 GPU での RDMA 接続確立テスト
+   - GLM-4.7 Q4 (IQ2_M より大きい量子化) がVRAMに収まるか検証
+   - `-sm layer` によるレイヤー分割で VRAM 分配計画を策定
+
+2. **GLM-4.7 Q4 量子化モデルの準備**
+   - unsloth GLM-4.7 Q4 のダウンロードとサイズ確認
+   - IQ2_M (~40GB) では11GPUで動作したが、Q4 はより大きいため16GPU が必要な可能性
+
+### 残課題・懸念事項
+
+#### Generation 速度での RPC 比劣位
+- RDMA は単一接続で全リモートデバイスを共有するため、graph_compute が逐次実行される
+- RPC はデバイスごとに独立ソケットを持ち、コマンド送信を並列化可能
+- **改善案**: RDMA 接続のデバイス分離またはパイプライン化 (未実装)
+
+#### サーバーGPU 計算時間のセッション間変動
+- RDMA (GDR 無効) の Generation 速度が 5.5-6.8 t/s と大きくばらつく
+- GPU のサーマルスロットリングまたは CUDA コンテキスト初期化の影響と推定
+- GDR 有効時は比較的安定 (6.6-6.9 t/s)
+
+#### クライアント異常切断後のサーバー復旧
+- クライアントがクラッシュした場合、サーバーの QP 状態が壊れることがある
+- 次のテスト実行前にサーバーの再起動が必要
+- シングルスレッドのサーバー設計に起因 (接続回復パスが未実装)
+
+#### GDR バジェットのデフォルト値
+- デフォルト 12GB は ConnectX-4 の MTT キャッシュ推定値 (~10-16GB) に基づく経験的な値
+- より大容量の RNIC (ConnectX-6 等) では `GGML_RDMA_GDR_BUDGET_GB` を増やすことで全デバイス GDR が可能
+- 現状では `GGML_RDMA_NO_GDR=1` も引き続き使用可能 (per-buffer フラグにフォールバック)
 
 ### 前提条件
-- Step 4 (GPUDirect RDMA) が動作していること
+- Step 4 (GPUDirect RDMA) が動作していること ✅
 - 16台のP100が利用可能であること (GPU追加後)
 
 ### 成功基準
 - GLM4.7 Q4 が16台P100で推論完了できること
-- 実用的な推論速度が得られること (具体値はStep 3/4の結果を踏まえて設定)
-
-### 備考
-- GPU追加前でも、11台でGLM4.7の事前検証は可能 (モデルがVRAMに収まる場合)
-- 収まらない場合はGPU追加を待つ
+- 実用的な推論速度が得られること (11GPU での IQ2_M 実績: pp=6.4, tg=6.8 t/s)
 
 ---
 
