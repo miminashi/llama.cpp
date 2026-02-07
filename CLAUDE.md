@@ -213,8 +213,9 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 
 ```bash
 cd /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend
-rm -rf build && cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+rm -rf build
+cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES="60"
+cmake --build build -- -j $(nproc)
 ```
 
 ### 2号機 (192.168.100.2) へのデプロイ
@@ -225,8 +226,14 @@ ssh 192.168.100.2 "rm -rf /home/ubuntu/projects/llama.cpp"
 rsync -a --exclude='.git' /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/ 192.168.100.2:/home/ubuntu/projects/llama.cpp/
 
 # 2号機でビルド
-ssh 192.168.100.2 "cd /home/ubuntu/projects/llama.cpp && rm -rf build && cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j\$(nproc)"
+ssh 192.168.100.2 "cd /home/ubuntu/projects/llama.cpp && rm -rf build && cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=60 && cmake --build build -- -j \$(nproc)"
 ```
+
+> **ビルドコマンドに関する注意:**
+> - `--config Release` は Unix Makefiles ジェネレータでは無視されるため不要（`CMAKE_BUILD_TYPE=Release` は cmake configure 時に自動設定される）
+> - `LLAMA_CURL` は非推奨で無視される（警告が出るだけ）ため除去
+> - SSH ダブルクォート内で `$(nproc)` を使う場合は `\$(nproc)` とエスケープすること（エスケープなしだとローカル側の値が展開される）
+> - `cmake --build build` の代わりに `make -C build -j$(nproc)` でも同等に動作する
 
 ### rdma-server 起動 (2号機)
 

@@ -1,0 +1,1040 @@
+# RDMA バックエンドの技術アーキテクチャ — llama.cpp 分散推論の設計と実装
+
+- **実施日時**: 2026年2月7日 17:58
+- **対象ブランチ**: `feature/rdma-backend`
+- **プロトコルバージョン**: 1.3.0
+
+| 項目 | 値 |
+|------|-----|
+| ソースファイル数 | 9 (ヘッダ3 + 実装4 + 公開API 1 + サーバーエントリ1) |
+| 総行数 | 5,537行 |
+| メイン実装 | `ggml/src/ggml-rdma/ggml-rdma.cpp` (3,172行) |
+| プロトコルコマンド数 | 26 |
+| Mermaid図 | 14枚 |
+
+---
+
+## 目次
+
+1. [背景と目的](#1-背景と目的)
+2. [llama.cpp のバックエンドシステム概要](#2-llamacpp-のバックエンドシステム概要)
+3. [RDMA バックエンド全体アーキテクチャ](#3-rdma-バックエンド全体アーキテクチャ)
+4. [ファイル構成とモジュール設計](#4-ファイル構成とモジュール設計)
+5. [RDMA トランスポート層](#5-rdma-トランスポート層)
+6. [メモリ管理](#6-メモリ管理)
+7. [プロトコル設計](#7-プロトコル設計)
+8. [テンソルデータ転送](#8-テンソルデータ転送)
+9. [グラフ計算と最適化](#9-グラフ計算と最適化)
+10. [サーバー実装](#10-サーバー実装)
+11. [デバイス登録と自動検出](#11-デバイス登録と自動検出)
+12. [性能最適化の推移](#12-性能最適化の推移)
+13. [GPUDirect RDMA](#13-gpudirect-rdma)
+14. [既知の課題と今後の展望](#14-既知の課題と今後の展望)
+15. [環境変数と設定リファレンス](#15-環境変数と設定リファレンス)
+16. [付録: コマンドリファレンス](#16-付録-コマンドリファレンス)
+
+---
+
+## 1. 背景と目的
+
+### llama.cpp と分散推論
+
+llama.cpp は C/C++ で実装された軽量な LLM 推論エンジンであり、ggml テンソルライブラリをベースに GPU (CUDA/Metal/Vulkan) や CPU で効率的な推論を実現する。しかし、GLM-4.7 (90B パラメータ、Q4_K_M で約50GB) のような大規模モデルは単一 GPU のメモリ (P100: 16GB) に収まらないため、複数ノードの GPU に分散して推論する必要がある。
+
+### RDMA (Remote Direct Memory Access)
+
+RDMA は CPU を介さずに NIC がリモートマシンのメモリに直接アクセスする技術である。InfiniBand では 100Gbps のリンク帯域を低レイテンシ (数μs) で利用でき、従来の TCP/IP (カーネルバッファコピー、コンテキストスイッチ) と比較して大幅な性能向上が見込める。
+
+本 RDMA バックエンドは llama.cpp の分散推論を InfiniBand RDMA で実現するもので、さらに GPUDirect RDMA (nvidia-peermem) による GPU VRAM への直接転送もサポートする。
+
+### ハードウェア構成
+
+| 項目 | 1号機 (クライアント) | 2号機 (サーバー) |
+|------|---------------------|-----------------|
+| IP アドレス | 192.168.100.1 | 192.168.100.2 |
+| GPU | Tesla P100 16GB × 7 | Tesla P100 16GB × 4 |
+| NIC | Mellanox ConnectX-4 | Mellanox ConnectX-4 |
+| リンク速度 | 100 Gbps InfiniBand | 100 Gbps InfiniBand |
+| CUDA Compute Capability | 6.0 | 6.0 |
+| nvidia-peermem | ロード済み | ロード済み |
+
+```mermaid
+graph TD
+    subgraph "1号機 (192.168.100.1) — クライアント"
+        CPU1[CPU]
+        GPU0[P100 #0]
+        GPU1[P100 #1]
+        GPU2[P100 #2]
+        GPU3[P100 #3]
+        GPU4[P100 #4]
+        GPU5[P100 #5]
+        GPU6[P100 #6]
+        NIC1[ConnectX-4<br/>100Gbps IB]
+        CPU1 --- GPU0
+        CPU1 --- GPU1
+        CPU1 --- GPU2
+        CPU1 --- GPU3
+        CPU1 --- GPU4
+        CPU1 --- GPU5
+        CPU1 --- GPU6
+        CPU1 --- NIC1
+    end
+    subgraph "2号機 (192.168.100.2) — サーバー"
+        CPU2[CPU]
+        GPU7[P100 #0]
+        GPU8[P100 #1]
+        GPU9[P100 #2]
+        GPU10[P100 #3]
+        NIC2[ConnectX-4<br/>100Gbps IB]
+        CPU2 --- GPU7
+        CPU2 --- GPU8
+        CPU2 --- GPU9
+        CPU2 --- GPU10
+        CPU2 --- NIC2
+    end
+    NIC1 <== "InfiniBand 100Gbps" ==> NIC2
+```
+
+---
+
+## 2. llama.cpp のバックエンドシステム概要
+
+ggml は4階層のバックエンド抽象化を持つ。RDMA バックエンドはこの抽象化に完全に準拠し、llama.cpp のスケジューラからは「もう1つの GPU バックエンド」として透過的に扱われる。
+
+### 4階層アーキテクチャ
+
+1. **Registry** (`ggml_backend_reg`): バックエンドの登録・検出。デバイス列挙と `proc_address` による拡張機能の提供
+2. **Device** (`ggml_backend_device`): 個々の計算デバイス。名前、メモリ量、バッファタイプの提供
+3. **Backend** (`ggml_backend`): 計算ストリーム。`graph_compute` によるグラフ実行
+4. **Buffer / Buffer Type** (`ggml_backend_buffer`, `ggml_backend_buffer_type`): メモリ管理。`set_tensor` / `get_tensor` によるデータ転送
+
+```mermaid
+classDiagram
+    class ggml_backend_reg {
+        +get_name()
+        +get_device_count()
+        +get_device(index)
+        +get_proc_address(name)
+    }
+    class ggml_backend_device {
+        +get_name()
+        +get_description()
+        +get_memory()
+        +get_type()
+        +init_backend()
+        +get_buffer_type()
+        +supports_op()
+        +supports_buft()
+    }
+    class ggml_backend {
+        +get_name()
+        +free()
+        +set_tensor_async()
+        +get_tensor_async()
+        +graph_compute()
+        +synchronize()
+    }
+    class ggml_backend_buffer_type {
+        +get_name()
+        +alloc_buffer(size)
+        +get_alignment()
+        +get_max_size()
+        +get_alloc_size()
+    }
+    class ggml_backend_buffer {
+        +free_buffer()
+        +get_base()
+        +init_tensor()
+        +set_tensor()
+        +get_tensor()
+        +cpy_tensor()
+        +clear()
+    }
+    ggml_backend_reg "1" --> "*" ggml_backend_device : enumerates
+    ggml_backend_device "1" --> "1" ggml_backend : creates
+    ggml_backend_device "1" --> "1" ggml_backend_buffer_type : provides
+    ggml_backend_buffer_type "1" --> "*" ggml_backend_buffer : allocates
+```
+
+参照: `ggml/src/ggml-backend-impl.h` — Registry (L194-210), Device (L140-188), Backend (L87-127), Buffer (L41-67)
+
+### スケジューラとレイヤー分散
+
+llama.cpp のスケジューラ (`ggml_backend_sched`) は、計算グラフのノード（テンソル演算）をバックエンドに割り当てる。`-sm layer` (レイヤー分割) モードでは、Transformer の各レイヤーが1つのバックエンドに割り当てられる。
+
+- ローカル GPU: `CUDA0`, `CUDA1`, ... → 直接 CUDA バックエンドで計算
+- リモート GPU: `RDMA0[host:port]`, `RDMA1[host:port]`, ... → RDMA バックエンドが中継
+
+スケジューラは RDMA バックエンドの存在を意識せず、通常の GPU バックエンドと同様にレイヤーを割り当てる。重み (`set_tensor`) とアクティベーション (`set_tensor` + `graph_compute` + `get_tensor`) の転送はすべてバックエンドインターフェースを通じて行われる。
+
+---
+
+## 3. RDMA バックエンド全体アーキテクチャ
+
+RDMA バックエンドはクライアント・サーバーモデルを採用する。クライアント (llama-cli / llama-bench が動作する1号機) がバックエンドインターフェース経由でリモートの rdma-server にコマンドを送信し、サーバーがローカル GPU 上で実際の計算を行う。
+
+```mermaid
+graph LR
+    subgraph "1号機 — クライアント"
+        CLI[llama-cli / llama-bench]
+        SCHED[ggml_backend_sched<br/>スケジューラ]
+        CUDA_BE["CUDA Backend<br/>(ローカル GPU 0-6)"]
+        RDMA_BE["RDMA Backend<br/>(リモート GPU 0-3)"]
+        CLI --> SCHED
+        SCHED --> CUDA_BE
+        SCHED --> RDMA_BE
+    end
+    subgraph "InfiniBand"
+        IB["100Gbps<br/>RDMA/IB Send/Recv<br/>RDMA Write/Read"]
+    end
+    subgraph "2号機 — サーバー"
+        SRV[rdma-server]
+        CUDA_SRV["CUDA Backend<br/>(ローカル GPU 0-3)"]
+        SRV --> CUDA_SRV
+    end
+    RDMA_BE <--> IB
+    IB <--> SRV
+```
+
+### データフローの概要
+
+1. **モデルロード時**: スケジューラが重みテンソルを各バックエンドに `set_tensor` で配布。RDMA バックエンドは RDMA Write (またはSend/Recv) でサーバーに転送
+2. **推論時 (トークンごと)**:
+   - スケジューラが計算グラフを分割し、各バックエンドの `graph_compute` を呼ぶ
+   - RDMA バックエンドはグラフをシリアライズしてサーバーに送信
+   - サーバーがローカル CUDA バックエンドで計算を実行
+   - 結果が必要なテンソルを `get_tensor` でクライアントに返却
+3. **最適化**: 2回目以降のトークンでは、グラフ構造が変わらなければデルタ更新やピュアリコンピュートで通信量を大幅削減
+
+---
+
+## 4. ファイル構成とモジュール設計
+
+### ファイル一覧
+
+| ファイル | 行数 | 役割 |
+|---------|------|------|
+| `ggml/src/ggml-rdma/ggml-rdma.cpp` | 3,172 | メイン実装: クライアント (バックエンド/バッファ/デバイス/レジストリ) + サーバー (rdma_server クラス) + プロトコル定義 |
+| `ggml/src/ggml-rdma/rdma-transport.cpp` | 869 | RDMA 接続管理: QP作成、Send/Recv、RDMA Write/Read、CQポーリング |
+| `ggml/src/ggml-rdma/rdma-transport.h` | 186 | トランスポート層のインターフェース定義 |
+| `ggml/src/ggml-rdma/rdma-memory.cpp` | 307 | ホストメモリ管理: メモリプール、ステージングバッファ |
+| `ggml/src/ggml-rdma/rdma-memory.h` | 109 | メモリ管理のインターフェース定義 |
+| `ggml/src/ggml-rdma/rdma-gdr.cpp` | 444 | GPUDirect RDMA: GPU メモリ登録、nvidia-peermem 管理 |
+| `ggml/src/ggml-rdma/rdma-gdr.h` | 116 | GPUDirect のインターフェース定義 |
+| `ggml/include/ggml-rdma.h` | 76 | 公開 C API: `ggml_backend_rdma_init()`, `ggml_backend_rdma_start_server()` 等 |
+| `tools/rdma/rdma-server.cpp` | 258 | サーバーバイナリのエントリポイント (`main()`) |
+
+### モジュール依存関係
+
+```mermaid
+graph TD
+    SERVER_MAIN["tools/rdma/rdma-server.cpp<br/>(エントリポイント)"]
+    PUBLIC_API["ggml/include/ggml-rdma.h<br/>(公開 C API)"]
+    MAIN["ggml/src/ggml-rdma/ggml-rdma.cpp<br/>(クライアント + サーバー + プロトコル)"]
+    TRANSPORT["rdma-transport.h/.cpp<br/>(RDMA 接続管理)"]
+    MEMORY["rdma-memory.h/.cpp<br/>(ホストメモリ管理)"]
+    GDR["rdma-gdr.h/.cpp<br/>(GPUDirect RDMA)"]
+    BACKEND_IMPL["ggml-backend-impl.h<br/>(ggml バックエンドIF)"]
+    LIBIBVERBS["libibverbs / librdmacm<br/>(RDMA ユーザスペースAPI)"]
+    CUDA_RT["CUDA Runtime<br/>(cudaMalloc, cudaMemcpy)"]
+
+    SERVER_MAIN --> PUBLIC_API
+    PUBLIC_API --> MAIN
+    MAIN --> TRANSPORT
+    MAIN --> MEMORY
+    MAIN --> GDR
+    MAIN --> BACKEND_IMPL
+    TRANSPORT --> LIBIBVERBS
+    MEMORY --> TRANSPORT
+    GDR --> TRANSPORT
+    GDR --> CUDA_RT
+    MEMORY --> CUDA_RT
+```
+
+---
+
+## 5. RDMA トランスポート層
+
+### RDMA の基礎概念
+
+RDMA プログラミングでは以下のオブジェクトを使用する:
+
+| 概念 | 説明 | 本実装での使い方 |
+|------|------|-----------------|
+| **PD** (Protection Domain) | メモリアクセス権限の境界 | 接続ごとに1つ (`ibv_alloc_pd`) |
+| **QP** (Queue Pair) | 送受信キューのペア。RC (Reliable Connected) タイプを使用 | 1接続 = 1QP。Send/Recv + RDMA Write/Read を共有 |
+| **CQ** (Completion Queue) | 操作完了通知キュー | Send CQ と Recv CQ を共有 (1つの CQ) |
+| **MR** (Memory Region) | RDMA アクセス可能なメモリ領域。`ibv_reg_mr` で登録 | バッファ確保時にサーバー側で登録し、rkey をクライアントに返す |
+| **WR** (Work Request) | QP に投入する操作指示 | Send WR / Recv WR / RDMA Write WR / RDMA Read WR |
+| **WC** (Work Completion) | CQ から取得する操作完了通知 | `ibv_poll_cq` でビジーポーリング |
+
+```mermaid
+graph LR
+    subgraph "RDMA Verbs オブジェクト"
+        CTX[ibv_context<br/>デバイスコンテキスト]
+        PD[ibv_pd<br/>Protection Domain]
+        CQ[ibv_cq<br/>Completion Queue]
+        QP["ibv_qp<br/>Queue Pair (RC)"]
+        MR[ibv_mr<br/>Memory Region]
+        CTX --> PD
+        PD --> QP
+        PD --> MR
+        CQ --> QP
+    end
+    subgraph "RDMA CM オブジェクト"
+        CHAN[rdma_event_channel]
+        CMID[rdma_cm_id]
+        CHAN --> CMID
+        CMID --> QP
+    end
+```
+
+### `rdma_connection` クラス
+
+`rdma_connection` (`rdma-transport.h:59-148`) は単一の RDMA 接続を管理するクラスで、以下の操作を提供する:
+
+| メソッド | 説明 | 用途 |
+|---------|------|------|
+| `connect(host, port)` | クライアント側接続確立 | クライアント起動時にサーバーに接続 |
+| `accept(cm_id)` | サーバー側接続受け入れ | サーバーがクライアント接続を受諾 |
+| `send(data, size)` | IB Send 操作 | コマンドヘッダ/データ/テンソルデータの送信 |
+| `recv(data, size)` | IB Recv 操作 | レスポンスの受信 |
+| `rdma_write(local, size, mr, remote)` | RDMA Write | テンソルデータの片側転送 (set_tensor) |
+| `rdma_read(local, size, mr, remote)` | RDMA Read | テンソルデータの片側読み出し (get_tensor, GDRのみ) |
+| `wait_for_completion(timeout)` | CQ ビジーポーリング | 全操作の完了待ち |
+
+主な設計特徴:
+
+- **send/recv はチャンク化対応**: 内部バッファ (16MB) を超えるデータは自動的に分割送信 (`rdma-transport.cpp:389-448`)
+- **ビジーポーリング**: `wait_for_completion` は `ibv_poll_cq` のループで実装。スリープによる遅延を排除 (`rdma-transport.cpp:649-688`)
+- **スレッド安全**: `send_mutex_` で送信操作を、`poll_mutex_` で CQ ポーリングを保護。さらに上位の `op_mutex_` (recursive_mutex) でコマンドシーケンス全体を保護 (`rdma-transport.h:139-147`)
+
+### コネクション確立フロー
+
+```mermaid
+sequenceDiagram
+    participant C as クライアント
+    participant R as RDMA CM
+    participant S as サーバー
+
+    Note over S: rdma_bind_addr + rdma_listen
+    C->>R: rdma_resolve_addr
+    R-->>C: ADDR_RESOLVED event
+    C->>R: rdma_resolve_route
+    R-->>C: ROUTE_RESOLVED event
+    C->>C: setup_qp (PD/CQ/QP作成)
+    C->>R: rdma_connect
+    R->>S: CONNECT_REQUEST event
+    S->>S: setup_qp (PD/CQ/QP作成)
+    S->>R: rdma_accept
+    R-->>C: ESTABLISHED event
+    R-->>S: ESTABLISHED event
+    C->>C: ibv_modify_qp(min_rnr_timer=1)
+    S->>S: ibv_modify_qp(min_rnr_timer=1)
+    Note over C,S: 接続確立完了
+```
+
+### RNR NAK 問題と修正
+
+IB Send/Recv はレシーバ側が事前に `ibv_post_recv` していない場合、RNR (Receiver Not Ready) NAK が返される。デフォルトの `min_rnr_timer=0` は 655.36ms の待機を意味し、3回リトライで約2秒のスパイクが発生する。
+
+**修正** (`rdma-transport.cpp:194-206, 341-350`): 接続確立直後に `ibv_modify_qp` で `min_rnr_timer=1` (0.01ms) に設定。クライアント側とサーバー側の両方で設定する。
+
+---
+
+## 6. メモリ管理
+
+### 3種のメモリタイプ
+
+`rdma-memory.h:15-19` で定義される3種のメモリタイプ:
+
+| タイプ | 定義 | 用途 | 確保方法 |
+|--------|------|------|---------|
+| `HOST` | 通常のホストメモリ | 汎用 | `posix_memalign` (4KBアライン) |
+| `HOST_PINNED` | ピン留めホストメモリ | ステージングバッファ | `cudaMallocHost` (CUDA) / `mlock` (非CUDA) |
+| `GPU_DIRECT` | GPU VRAM | GPUDirect RDMA | `gdr_memory_manager` 経由 |
+
+### データ転送パス
+
+テンソルデータの転送には、GPUDirect 有効時と CPU ステージング経由の2つのパスがある:
+
+```mermaid
+graph TD
+    subgraph "GPUDirect RDMA パス"
+        C_GPU1[クライアント GPU VRAM]
+        C_NIC1[クライアント NIC]
+        S_NIC1[サーバー NIC]
+        S_GPU1[サーバー GPU VRAM]
+        C_GPU1 -->|"PCIe DMA"| C_NIC1
+        C_NIC1 -->|"InfiniBand<br/>RDMA Write"| S_NIC1
+        S_NIC1 -->|"PCIe DMA<br/>(nvidia-peermem)"| S_GPU1
+    end
+    subgraph "CPU ステージング パス"
+        C_DATA[クライアント ホストメモリ]
+        C_STAGE[クライアント<br/>ステージングバッファ]
+        C_NIC2[クライアント NIC]
+        S_NIC2[サーバー NIC]
+        S_STAGE[サーバー<br/>ステージングバッファ]
+        S_GPU2[サーバー GPU VRAM]
+        C_DATA -->|"memcpy"| C_STAGE
+        C_STAGE -->|"InfiniBand<br/>RDMA Write"| C_NIC2
+        C_NIC2 --> S_NIC2
+        S_NIC2 -->|"DMA to host"| S_STAGE
+        S_STAGE -->|"cudaMemcpy<br/>(FLUSH_STAGING)"| S_GPU2
+    end
+```
+
+### ステージングバッファ
+
+CPU ステージングパスでは、サーバーがバッファ確保時 (`alloc_buffer`) にホストメモリのステージングバッファを割り当て、RDMA MR として登録する (`ggml-rdma.cpp:2591-2627`)。クライアントは返却された `mr_addr` / `mr_rkey` を使って RDMA Write でステージングに書き込み、`FLUSH_STAGING` コマンドで `cudaMemcpy(H2D)` をトリガーする。
+
+### 4GB バッファサイズ制限
+
+`ggml-rdma.cpp:846` で定義:
+```cpp
+static constexpr size_t RDMA_WRITE_MAX_BUFFER_SIZE = (size_t)4 * 1024 * 1024 * 1024; // 4GB
+```
+
+RNIC (NIC 内蔵のページテーブルキャッシュ) は登録された MR のページテーブルを保持するが、複数の大規模 MR (>4GB) を同時に登録するとキャッシュオーバーフローが発生し、`remote access error` (vendor_err=0x88) になる。4GB 以下のバッファのみ RDMA Write パスを使用し、超過分は Send/Recv にフォールバックする。
+
+### `rdma_memory_pool` と `rdma_staging_buffer`
+
+- **`rdma_memory_pool`** (`rdma-memory.cpp:22-266`): メモリ確保と RDMA MR 登録を一元管理。`remote_ptr` によるルックアップ機能。
+- **`rdma_staging_buffer`** (`rdma-memory.cpp:270-307`): サイズ可変のステージングバッファ。`HOST_PINNED` で確保し、必要に応じて25%の成長係数で再確保。
+
+---
+
+## 7. プロトコル設計
+
+### メッセージフォーマット
+
+クライアント→サーバーのリクエスト:
+```
+[cmd(1B) | input_size(8B)]  ← ヘッダ (1回目の Send)
+[input_data(NB)]             ← データ (2回目の Send, input_size > 0 の場合)
+```
+
+サーバー→クライアントのレスポンス (Adaptive Response):
+- **小レスポンス** (≤ 256B): `[rsp_size(8B) | rsp_data(NB)]` — 1回の Send
+- **大レスポンス** (> 256B): `[rsp_size(8B)]` + `[rsp_data(NB)]` — 2回の Send (ゼロコピー)
+- **データなしレスポンス**: `[rsp_size(8B) = 0]` — 1回の Send
+
+参照: `ggml-rdma.cpp:136` (`RDMA_ADAPTIVE_RSP_THRESHOLD = 256`)
+
+### コマンド一覧
+
+`ggml-rdma.cpp:162-191` で定義される全26コマンド:
+
+| # | コマンド | 値 | リクエスト | レスポンス | 説明 |
+|---|---------|-----|-----------|-----------|------|
+| 0 | `ALLOC_BUFFER` | 0 | `{device, size}` | `{remote_ptr, remote_size, mr_addr, mr_rkey}` | リモートバッファ確保 |
+| 1 | `GET_ALIGNMENT` | 1 | `{device}` | `{alignment}` | アライメント取得 |
+| 2 | `GET_MAX_SIZE` | 2 | `{device}` | `{max_size}` | 最大バッファサイズ取得 |
+| 3 | `BUFFER_GET_BASE` | 3 | `{remote_ptr}` | `{base_ptr}` | バッファベースアドレス取得 |
+| 4 | `FREE_BUFFER` | 4 | `{remote_ptr}` | (empty) | バッファ解放 |
+| 5 | `BUFFER_CLEAR` | 5 | `{remote_ptr, value}` | (empty) | バッファクリア |
+| 6 | `SET_TENSOR` | 6 | `{rdma_tensor, offset, data}` | (empty) | テンソルデータ書き込み (Send/Recv) |
+| 7 | `GET_TENSOR` | 7 | `{rdma_tensor, offset, size}` | `{data}` | テンソルデータ読み出し |
+| 8 | `COPY_TENSOR` | 8 | `{src_tensor, dst_tensor}` | `{result}` | テンソルコピー |
+| 9 | `GRAPH_COMPUTE` | 9 | `{serialized_graph}` | (empty) | フルグラフ計算 |
+| 10 | `GET_DEVICE_MEMORY` | 10 | `{device}` | `{free_mem, total_mem}` | デバイスメモリ情報取得 |
+| 11 | `INIT_TENSOR` | 11 | `{rdma_tensor}` | (empty) | テンソル初期化 (量子化パディング) |
+| 12 | `GET_ALLOC_SIZE` | 12 | `{device, tensor, srcs}` | `{alloc_size}` | 確保サイズ取得 |
+| 13 | `HELLO` | 13 | (empty) | `{major, minor, patch, gdr_available}` | バージョン確認 |
+| 14 | `DEVICE_COUNT` | 14 | (empty) | `{device_count}` | デバイス数取得 |
+| 15 | `GRAPH_RECOMPUTE` | 15 | `{device}` | (empty) | キャッシュ済みグラフの再計算 |
+| 16 | `REGISTER_MR` | 16 | `{remote_ptr, size}` | `{mr_addr, mr_rkey, success}` | MR 登録 |
+| 17 | `DEREGISTER_MR` | 17 | - | - | MR 登録解除 |
+| 18 | `GET_MR_INFO` | 18 | `{remote_ptr}` | `{mr_addr, mr_rkey, size}` | MR 情報取得 |
+| 19 | `RDMA_WRITE_DONE` | 19 | - | - | RDMA Write 完了通知 |
+| 20 | `RDMA_READ_DONE` | 20 | - | - | RDMA Read 完了通知 |
+| 21 | `GRAPH_COMPUTE_UPDATE` | 21 | `{device, n_updates, updates}` | (empty) | デルタ更新付きグラフ計算 |
+| 22 | `FLUSH_STAGING` | 22 | `{remote_ptr, offset, size}` | (empty) | 単一バッファのステージングフラッシュ |
+| 23 | `FLUSH_ALL_STAGING` | 23 | `{flush_entries[]}` | (empty) | 全ダーティバッファの一括フラッシュ |
+| 24 | `FLUSH_AND_RECOMPUTE` | 24 | `{n_flush, entries[], device}` | (empty) | フラッシュ + 再計算 (統合コマンド) |
+| 25 | `FLUSH_AND_COMPUTE_UPDATE` | 25 | `{n_flush, entries[], device, n_updates, updates[]}` | (empty) | フラッシュ + デルタ更新計算 (統合コマンド) |
+
+### `rdma_tensor` シリアライゼーション
+
+テンソルは `rdma_tensor` 構造体 (`ggml-rdma.cpp:142-157`) にシリアライズされる:
+
+```
+rdma_tensor (packed, 8B aligned):
+  id:        uint64_t   — テンソルのポインタアドレス (一意識別子)
+  type:      uint32_t   — ggml_type
+  buffer:    uint64_t   — バッファの remote_ptr (RDMA バッファの場合のみ)
+  ne[4]:     uint32_t×4 — 各次元のサイズ
+  nb[4]:     uint32_t×4 — 各次元のストライド
+  op:        uint32_t   — ggml_op
+  op_params: int32_t×16 — 演算パラメータ
+  flags:     int32_t    — テンソルフラグ
+  src[10]:   uint64_t×10— ソーステンソルのポインタ
+  view_src:  uint64_t   — ビューソースのポインタ
+  view_offs: uint64_t   — ビューオフセット
+  data:      uint64_t   — データポインタ
+  name:      char×64    — テンソル名
+  padding:   char×4     — 8B アライメント用パディング
+```
+
+### リクエスト・レスポンスプロトコル
+
+```mermaid
+sequenceDiagram
+    participant C as クライアント
+    participant S as サーバー
+
+    Note over C,S: 小レスポンス (≤256B) の場合
+    C->>S: [cmd(1B) | input_size(8B)]
+    C->>S: [input_data(NB)]
+    S->>C: [rsp_size(8B) | rsp_data(NB)]
+
+    Note over C,S: データなしレスポンスの場合
+    C->>S: [cmd(1B) | input_size(8B)]
+    C->>S: [input_data(NB)]
+    S->>C: [rsp_size(8B) = 0]
+
+    Note over C,S: 大レスポンス (>256B) の場合
+    C->>S: [cmd(1B) | input_size(8B)]
+    C->>S: [input_data(NB)]
+    S->>C: [rsp_size(8B)]
+    S->>C: [rsp_data(NB)]
+```
+
+---
+
+## 8. テンソルデータ転送
+
+### set_tensor: クライアント→サーバーの書き込み
+
+`ggml_backend_rdma_buffer_set_tensor` (`ggml-rdma.cpp:833-933`) は2つのパスを持つ:
+
+**パス1: RDMA Write + バッチフラッシュ** (高速パス)
+- 条件: `mr_rkey != 0` (MR登録済み) かつ `staging` (ステージングバッファあり) かつバッファサイズ ≤ 4GB かつ `rdma_write_disabled` でない
+- 動作: 16MB チャンクで RDMA Write → `pending_flush_list` にダーティ領域を記録
+- フラッシュは `graph_compute` 時にまとめて実行 (バッチフラッシュ)
+
+**パス2: Send/Recv** (フォールバック)
+- 条件: RDMA Write が使えない場合、または Write 失敗後
+- 動作: `SET_TENSOR` コマンドでテンソルメタデータ + データをシリアライズして Send
+
+### get_tensor: サーバー→クライアントの読み出し
+
+`ggml_backend_rdma_buffer_get_tensor` (`ggml-rdma.cpp:935-995`) も2つのパスを持つ:
+
+**パス1: RDMA Read** (GPUDirect 有効時のみ)
+- 条件: `mr_rkey != 0` かつ GDR 有効 (`GGML_RDMA_NO_GDR` 未設定)
+- 動作: サーバーの GPU VRAM から直接 RDMA Read
+- 注意: CPU ステージング使用時は **使用不可** (ステージングバッファにはコンピュート結果が反映されないため)
+
+**パス2: Send/Recv** (フォールバック)
+- 動作: `GET_TENSOR` コマンドでサーバーに要求 → サーバーが `ggml_backend_tensor_get` (cudaMemcpy D2H) → Send で返却
+
+### バッチフラッシュ機構
+
+`pending_flush_list` (`ggml-rdma.cpp:342-374`) はダーティ領域を追跡する:
+
+```mermaid
+sequenceDiagram
+    participant C as クライアント
+    participant FLUSH as pending_flush_list
+    participant IB as InfiniBand
+    participant S as サーバー
+
+    Note over C: モデルロード中 (多数の set_tensor)
+    loop 各テンソルの set_tensor
+        C->>IB: RDMA Write (16MB チャンク)
+        IB->>S: ステージングバッファに書き込み
+        C->>FLUSH: add(remote_ptr, offset, size)
+    end
+    Note over FLUSH: バッファごとに bounding box を統合
+
+    Note over C: graph_compute 呼び出し時
+    C->>FLUSH: drain() → flush_entries[]
+    C->>S: FLUSH_AND_RECOMPUTE<br/>{n_flush, entries[], device}
+    Note over S: 各バッファの dirty 範囲を<br/>cudaMemcpy(H2D)
+    Note over S: graph_compute 実行
+    S->>C: rsp_size = 0 (完了)
+```
+
+`pending_flush_list` はバッファ単位で bounding box (最小オフセット〜最大エンド) を管理する。同一バッファへの複数の `set_tensor` は1つのフラッシュエントリに統合され、`cudaMemcpy` 回数を最小化する。
+
+---
+
+## 9. グラフ計算と最適化
+
+### 計算グラフの概念
+
+ggml の `ggml_cgraph` はテンソル演算の有向非巡回グラフ (DAG) で、`nodes[]` 配列にトポロジカルソート済みのノード列が格納される。各ノードはソーステンソルへの参照 (`src[]`) を持つ。
+
+RDMA バックエンドは、このグラフをクライアントからサーバーに転送して実行する。初回はフルグラフを送信するが、2回目以降のトークンではグラフ構造が通常変わらないため、大幅に最適化できる。
+
+### 3つの実行パス
+
+`ggml_backend_rdma_graph_compute` (`ggml-rdma.cpp:1274-1430`) は `graph_cache` を用いて3つのパスを選択する:
+
+```mermaid
+flowchart TD
+    START[graph_compute 呼び出し] --> DRAIN["pending_flush_list.drain()"]
+    DRAIN --> CACHE{"graph_cache.is_cached()?<br/>構造比較: n_nodes, type, op, ne, src"}
+    CACHE -->|No| FULL["Full Graph Send<br/>GRAPH_COMPUTE コマンド<br/>(グラフ全体をシリアライズ)"]
+    CACHE -->|Yes| DELTA{"collect_updates()<br/>op_params, data, nb, flags<br/>の変更を検出"}
+    DELTA -->|変更なし| RECOMPUTE["Pure Recompute<br/>FLUSH_AND_RECOMPUTE<br/>(フラッシュ + デバイスIDのみ送信)"]
+    DELTA -->|変更あり| UPDATE["Delta Update<br/>FLUSH_AND_COMPUTE_UPDATE<br/>(フラッシュ + 変更テンソルのみ送信)"]
+    FULL --> SNAPSHOT["graph_cache を更新<br/>(build_snapshot_map + add)"]
+    RECOMPUTE --> SNAPSHOT
+    UPDATE --> SNAPSHOT
+    SNAPSHOT --> DONE[完了]
+```
+
+### graph_cache の仕組み
+
+`graph_cache` (`ggml-rdma.cpp:420-571`) は以下の役割を持つ:
+
+1. **構造比較** (`is_cached`): `n_nodes`, `type`, `op`, `ne[]`, `src[]` ポインタを比較。これらが同じならグラフ構造は不変
+2. **デルタ検出** (`collect_updates`): `op_params`, `data`, `nb[]`, `flags` の変更を検出。`snapshot_map_` (ポインタ→スナップショットのマップ) を使ってO(1)ルックアップ
+3. **スナップショット管理** (`build_snapshot_map`, `add`): ノードとその全ソーステンソルの `memcpy` スナップショットを保存
+
+### 各パスのワイヤーフォーマット
+
+| パス | コマンド | ペイロードサイズ | 説明 |
+|------|---------|----------------|------|
+| Full Graph | `GRAPH_COMPUTE` | `8 + 8*N_nodes + 4 + sizeof(rdma_tensor)*N_tensors` | 全テンソル (ノード+ソース) を送信 |
+| Delta Update | `FLUSH_AND_COMPUTE_UPDATE` | `4 + 24*N_flush + 4 + 4 + 100*N_updates` | 変更テンソルのみ (100B/テンソル) |
+| Pure Recompute | `FLUSH_AND_RECOMPUTE` | `4 + 24*N_flush + 4` | フラッシュエントリ + デバイスIDのみ |
+
+典型的なケース (gpt-oss-20b, 推論時):
+- Full Graph: 初回のみ。数百KBのペイロード
+- Delta Update: 初期数トークン。数KBのペイロード
+- Pure Recompute: 大半のトークン。**数十バイト**のペイロード
+
+### Combined コマンド
+
+ステージングフラッシュとグラフ計算は元々別々のラウンドトリップ (FLUSH_ALL_STAGING + GRAPH_RECOMPUTE/GRAPH_COMPUTE_UPDATE) だったが、1回のラウンドトリップに統合した:
+
+- `FLUSH_AND_RECOMPUTE` (コマンド24): フラッシュ + 再計算
+- `FLUSH_AND_COMPUTE_UPDATE` (コマンド25): フラッシュ + デルタ更新 + 計算
+
+これにより、トークンあたりのラウンドトリップが2回から1回に削減される。
+
+---
+
+## 10. サーバー実装
+
+### `rdma_server` クラス
+
+`rdma_server` (`ggml-rdma.cpp:1905-2814`) はサーバー側のコマンドハンドラで、以下を管理する:
+
+| メンバ | 型 | 用途 |
+|--------|-----|------|
+| `backends_` | `vector<ggml_backend_t>` | ローカル CUDA バックエンド群 |
+| `buffers_` | `unordered_set<ggml_backend_buffer_t>` | 確保済みバッファ |
+| `buffer_mrs_` | `unordered_map<buffer, ibv_mr*>` | バッファの RDMA MR |
+| `buffer_device_map_` | `unordered_map<buffer, uint32_t>` | バッファのデバイスID |
+| `staging_buffers_` | `unordered_map<buffer, host_staging_info>` | ホストステージングバッファ |
+| `stored_graphs_` | `vector<stored_graph>` | デバイスごとのキャッシュ済みグラフ |
+
+### イベントループ
+
+サーバーのメインループ (`ggml-rdma.cpp:2920-3160`) はシングルスレッドで動作し、以下のサイクルを繰り返す:
+
+```mermaid
+stateDiagram-v2
+    [*] --> WaitConnection: rdma_listen
+    WaitConnection --> Connected: accept_connection
+    Connected --> WaitCommand: クライアント接続
+    WaitCommand --> RecvHeader: recv [cmd|size]
+    RecvHeader --> RecvData: size > 0
+    RecvHeader --> Dispatch: size = 0
+    RecvData --> Dispatch: recv [data]
+    Dispatch --> HandleCmd: switch(cmd)
+    HandleCmd --> SendResponse: send_rsp / send_rsp_empty
+    SendResponse --> WaitCommand: 次のコマンド待ち
+    WaitCommand --> Disconnected: recv 失敗
+    Disconnected --> WaitConnection: 次の接続待ち
+```
+
+### グラフの逆シリアライゼーション
+
+サーバーは `deserialize_tensor` (`ggml-rdma.cpp:2724-2765`) と `create_node` (`ggml-rdma.cpp:2767-2804`) でクライアントから受信したグラフを再構築する:
+
+1. `rdma_tensor` の `buffer` フィールドからサーバー側の `ggml_backend_buffer_t` を復元
+2. `data` フィールドはバッファのベースアドレス + オフセットで検証
+3. `src[]` と `view_src` のポインタIDから再帰的にテンソルツリーを構築
+
+### クロスデバイスコピー処理
+
+マルチGPUサーバーでは、あるノードのソーステンソルが別のGPUのバッファに存在する場合がある (スケジューラがレイヤー境界でテンソルを共有するため)。`fix_cross_device_refs` (`ggml-rdma.cpp:2649-2721`) がこれを処理する:
+
+1. グラフノードの各ソーステンソルについて、バッファのデバイスIDを確認
+2. 異なるデバイスのテンソルは D2H + H2D (ホスト経由コピー) で対象デバイスに複製
+3. テンソルの `data` ポインタを新しいアドレスに書き換え
+4. 一時確保は `stored_graph.cross_device_allocs` で管理し、次回のグラフ更新時に解放
+
+---
+
+## 11. デバイス登録と自動検出
+
+### `GGML_RDMA_SERVERS` 環境変数
+
+RDMA バックエンドのデバイスは `GGML_RDMA_SERVERS` 環境変数で指定する:
+
+```bash
+export GGML_RDMA_SERVERS=192.168.100.2:50051
+```
+
+複数サーバーはカンマ区切り:
+```bash
+export GGML_RDMA_SERVERS=192.168.100.2:50051,192.168.100.3:50052
+```
+
+### デバイス検出フロー
+
+```mermaid
+flowchart LR
+    ENV["GGML_RDMA_SERVERS<br/>環境変数パース"] --> PARSE["parse_server_list<br/>カンマ分割"]
+    PARSE --> CONN["各サーバーに接続<br/>get_connection"]
+    CONN --> HELLO["HELLO コマンド<br/>バージョン確認"]
+    HELLO --> COUNT["DEVICE_COUNT<br/>デバイス数取得"]
+    COUNT --> REG["レジストリ登録<br/>RDMA0[host:port]<br/>RDMA1[host:port]<br/>..."]
+    REG --> SCHED["スケジューラに公開<br/>ggml_backend_sched"]
+```
+
+参照: `ggml-rdma.cpp:1743-1801` (`ggml_backend_rdma_reg`)
+
+### デバイス命名規則
+
+デバイスは `RDMA{index}[{host}:{port}]` の形式で命名される:
+- `RDMA0[192.168.100.2:50051]` — サーバー上の0番目のGPU
+- `RDMA1[192.168.100.2:50051]` — サーバー上の1番目のGPU
+
+この名前は `supports_buft` (`ggml-rdma.cpp:1527-1540`) でバッファタイプの互換性チェックに使われる。`strcmp` による厳密一致で、異なるデバイスのバッファを誤って受け入れることを防ぐ。
+
+---
+
+## 12. 性能最適化の推移
+
+### 最適化履歴
+
+| 最適化 | 効果 | 実装箇所 |
+|--------|------|---------|
+| 初期実装 (素朴なSend/Recv) | 0.3 t/s | — |
+| Persistent staging buffer | メモリ再確保の排除 | `rdma-memory.cpp:270-307` |
+| Graph diff (デルタ更新) | 2回目以降のトークンでグラフ送信不要 | `ggml-rdma.cpp:420-571` |
+| Adaptive response | 小レスポンスの Recv 回数半減 | `ggml-rdma.cpp:136, 670-712` |
+| Batch flush | 複数テンソルの一括ステージング転送 | `ggml-rdma.cpp:342-374` |
+| Combined コマンド (FLUSH+COMPUTE) | ラウンドトリップ 2→1 | `ggml-rdma.cpp:1296-1366` |
+| `min_rnr_timer=1` | RNR NAK スパイク (2s→0.01ms) | `rdma-transport.cpp:194-206` |
+| RDMA Write (16MB チャンク) | set_tensor の高速化 | `ggml-rdma.cpp:857-893` |
+| GPUDirect RDMA | CPU ステージング排除 | `rdma-gdr.cpp`, `ggml-rdma.cpp:1955-1964` |
+
+### 性能推移
+
+```mermaid
+xychart-beta
+    title "qwen2.5-0.5b tg32 性能推移 (t/s)"
+    x-axis ["初期", "Staging", "Graph Diff", "Adaptive", "Batch Flush", "Combined", "RNR Fix", "GPUDirect"]
+    y-axis "Generation t/s" 0 --> 200
+    bar [0.3, 15, 85, 120, 148, 165, 173, 173]
+```
+
+### gpt-oss-20b 最終性能 (RDMA 1+1 構成)
+
+| モード | pp128 (t/s) | ローカル比 | tg32 (t/s) | ローカル比 |
+|--------|:-----------:|:----------:|:----------:|:----------:|
+| ローカル 1GPU | 407.68 | 100% | 64.27 | 100% |
+| **GPUDirect RDMA 1+1** | **403.69** | **99.0%** | **59.52** | **92.6%** |
+| CPU staging RDMA 1+1 | 61.06 | 15.0% | 59.30 | 92.3% |
+
+---
+
+## 13. GPUDirect RDMA
+
+### nvidia-peermem の仕組み
+
+GPUDirect RDMA は NVIDIA の `nvidia-peermem` カーネルモジュールが提供する機能で、NIC が PCIe を通じて GPU VRAM に直接アクセスすることを可能にする。通常の RDMA 操作 (`ibv_reg_mr`) で GPU メモリを登録するだけで、NIC が GPU VRAM をDMA先として認識する。
+
+```mermaid
+graph LR
+    subgraph "GPUDirect RDMA データパス"
+        GPU_VRAM[GPU VRAM]
+        PCIE1[PCIe Switch]
+        NIC[InfiniBand NIC]
+        WIRE[InfiniBand Link<br/>100Gbps]
+        GPU_VRAM <--> PCIE1
+        PCIE1 <--> NIC
+        NIC <--> WIRE
+    end
+    subgraph "CPU Staging データパス"
+        GPU_VRAM2[GPU VRAM]
+        PCIE2[PCIe]
+        CPU[CPU + Host Memory]
+        PCIE3[PCIe]
+        NIC2[InfiniBand NIC]
+        WIRE2[InfiniBand Link]
+        GPU_VRAM2 <-->|"cudaMemcpy"| PCIE2
+        PCIE2 <--> CPU
+        CPU <--> PCIE3
+        PCIE3 <--> NIC2
+        NIC2 <--> WIRE2
+    end
+```
+
+GPUDirect RDMA は CPU バッファリングを排除し、PCIe ホップを1つ削減する。
+
+### `gdr_memory_manager` クラス
+
+`gdr_memory_manager` (`rdma-gdr.h:26-85`, `rdma-gdr.cpp:97-330`) は GPU メモリの RDMA 登録を管理する:
+
+| メソッド | 説明 |
+|---------|------|
+| `is_available()` | nvidia-peermem ロード確認 + `GGML_RDMA_NO_GDR` チェック |
+| `is_peermem_loaded()` | `/sys/module/nvidia_peermem/initstate` を確認 |
+| `init_device(device_id)` | GPU デバイス初期化 (Compute Cap 3.5+ 確認) |
+| `register_gpu_memory(addr, size, device_id)` | `ibv_reg_mr` で GPU VRAM を直接登録 |
+| `get_remote_info(region)` | クライアントに渡す `{addr, rkey, size}` を取得 |
+
+### サーバー側の統合
+
+サーバーの `alloc_buffer` (`ggml-rdma.cpp:1936-1978`) では:
+
+1. **GDR 有効時**: GPU バッファの `base` アドレスを直接 `ibv_reg_mr` → `mr_addr`/`mr_rkey` をクライアントに返却。クライアントの RDMA Write は GPU VRAM に直接到達する
+2. **GDR 無効時**: ホストステージングバッファを `cudaMallocHost` で確保 → MR 登録 → クライアントの RDMA Write はホストメモリに到達 → `FLUSH_STAGING` で `cudaMemcpy(H2D)` を実行
+
+### 性能比較
+
+gpt-oss-20b (1+1 GPU, RDMA) での pp128 (Prompt processing) 比較:
+
+- **GPUDirect RDMA**: 403.69 t/s (ローカル比 99.0%)
+- **CPU Staging**: 61.06 t/s (ローカル比 15.0%)
+- **改善率**: 6.6倍
+
+pp128 が劇的に改善される理由: Prompt processing は多数の重みテンソルを GPU にロードする必要があり、GPUDirect ではこの転送が CPU を経由しないため。tg32 (Generation) では差が小さい。これは生成時のテンソル転送量がPrompt時より大幅に少ないためである。
+
+### 既知の制限
+
+- **大規模モデルでのタイムアウト**: GLM-4.7 IQ2_M (~10GB/GPU バッファ) では GPUDirect RDMA Write が30秒でタイムアウト。gpt-oss-20b では正常動作。原因はPCIe帯域の輻輳またはRNIC内部制限の可能性。ワークアラウンド: `GGML_RDMA_NO_GDR=1`
+
+---
+
+## 14. 既知の課題と今後の展望
+
+### 既知の課題
+
+| 課題 | 影響 | 状態 | ワークアラウンド |
+|------|------|------|-----------------|
+| RDMA 出力品質バグ | GLM-4.7 IQ2_M で thinking トークンがガーベジ | 未解決 | RPC バックエンド使用 |
+| GPUDirect タイムアウト (大規模モデル) | GLM-4.7 で GDR 使用不可 | 未解決 | `GGML_RDMA_NO_GDR=1` |
+| シングルスレッドサーバー | 接続は1つのみ処理 | 設計制約 | - |
+| RNIC ページテーブルオーバーフロー | 4GB超の MR で remote access error | 修正済み | 4GB 制限 + Send/Recv フォールバック |
+
+### RDMA 出力品質バグ
+
+GLM-4.7 IQ2_M で RDMA バックエンドを使用すると、`[Start thinking]` トークンの後の出力がすべてガーベジになる。同じモデル・同じプロンプトで:
+- **RPC バックエンド**: 正常出力
+- **ローカル (7C+CPU)**: 正常出力
+- **RDMA バックエンド**: ガーベジ出力
+
+原因は `get_tensor` / logits 転送パスのデータ破損の可能性が高い。小規模モデル (gpt-oss-20b) での RDMA 動作検証が次のデバッグステップ。
+
+### 今後の展望
+
+1. **16 GPU スケーリング**: 現在 11GPU (7+4) を 16GPU (8+8) に拡張し、GLM-4.7 Q4_K_M を動作させる (Step 5)
+2. **出力バグ修正**: RDMA get_tensor / logits 転送パスのデバッグ
+3. **非同期操作**: 現在すべて同期的な操作を CUDA ストリームと統合した非同期化
+4. **マルチクライアントサポート**: シングルスレッドサーバーのマルチスレッド化
+
+---
+
+## 15. 環境変数と設定リファレンス
+
+### 環境変数一覧
+
+| 環境変数 | 説明 | デフォルト |
+|---------|------|----------|
+| `GGML_RDMA_SERVERS` | RDMA サーバーリスト (host:port, カンマ区切り) | 未設定 |
+| `GGML_RDMA_NO_GDR` | `1` で GPUDirect RDMA を無効化 | 未設定 (GDR有効) |
+| `GGML_RDMA_NO_STAGING` | `1` でホストステージングバッファを無効化 (Send/Recvのみ) | 未設定 |
+| `GGML_RDMA_PROFILE` | `1` でクライアント側プロファイリング有効化 | 未設定 |
+| `GGML_RDMA_DEBUG` | `1` でデバッグログ出力 | 未設定 |
+
+### ビルドコマンド
+
+```bash
+# 1号機でビルド
+cd /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend
+rm -rf build
+cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES="60"
+cmake --build build -- -j $(nproc)
+```
+
+### デプロイコマンド
+
+```bash
+# 2号機にデプロイ
+ssh 192.168.100.2 "rm -rf /home/ubuntu/projects/llama.cpp"
+rsync -a --exclude='.git' \
+  /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/ \
+  192.168.100.2:/home/ubuntu/projects/llama.cpp/
+
+# 2号機でビルド
+ssh 192.168.100.2 "cd /home/ubuntu/projects/llama.cpp && \
+  rm -rf build && \
+  cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=60 && \
+  cmake --build build -- -j \$(nproc)"
+```
+
+### 実行コマンド
+
+```bash
+# 2号機: rdma-server 起動
+ssh 192.168.100.2 "GGML_RDMA_NO_GDR=1 \
+  LD_LIBRARY_PATH=/home/ubuntu/projects/llama.cpp/build/bin \
+  nohup /home/ubuntu/projects/llama.cpp/build/bin/rdma-server \
+  -H 0.0.0.0 -p 50051 > /tmp/rdma-server.log 2>&1 &"
+
+# 1号機: llama-bench 実行 (gpt-oss-20b, 2GPU)
+GGML_RDMA_NO_GDR=1 GGML_RDMA_SERVERS=192.168.100.2:50051 \
+  CUDA_VISIBLE_DEVICES=0 build/bin/llama-bench \
+  -m /home/ubuntu/models/gpt-oss-20b-Q4_K_M.gguf \
+  -ngl 999 -sm layer -r 1 -p 128 -n 32
+```
+
+---
+
+## 16. 付録: コマンドリファレンス
+
+### ワイヤーフォーマット詳細
+
+#### 共通ヘッダ (クライアント→サーバー)
+
+| オフセット | サイズ | フィールド | 説明 |
+|-----------|--------|----------|------|
+| 0 | 1B | `cmd` | `rdma_cmd` 列挙値 |
+| 1 | 8B | `input_size` | 後続データのバイト数 |
+
+#### ALLOC_BUFFER (cmd=0)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 4B | `device` |
+| 4 | 8B | `size` |
+
+レスポンス:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 8B | `remote_ptr` |
+| 8 | 8B | `remote_size` |
+| 16 | 8B | `mr_addr` |
+| 24 | 4B | `mr_rkey` |
+
+#### SET_TENSOR (cmd=6)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | sizeof(rdma_tensor) | `tensor` |
+| sizeof(rdma_tensor) | 8B | `offset` |
+| sizeof(rdma_tensor)+8 | N | `data` |
+
+レスポンス: `rsp_size = 0`
+
+#### GET_TENSOR (cmd=7)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | sizeof(rdma_tensor) | `tensor` |
+| sizeof(rdma_tensor) | 8B | `offset` |
+| sizeof(rdma_tensor)+8 | 8B | `size` |
+
+レスポンス: `[rsp_size(8B)] [data(NB)]`
+
+#### GRAPH_COMPUTE (cmd=9)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 4B | `device` |
+| 4 | 4B | `n_nodes` |
+| 8 | 8B × n_nodes | `node_ids[]` |
+| 8 + 8×n_nodes | 4B | `n_tensors` |
+| 12 + 8×n_nodes | sizeof(rdma_tensor) × n_tensors | `tensors[]` |
+
+レスポンス: `rsp_size = 0`
+
+#### GRAPH_COMPUTE_UPDATE (cmd=21)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 4B | `device` |
+| 4 | 4B | `n_updates` |
+| 8 | 100B × n_updates | `rdma_tensor_update[]` |
+
+`rdma_tensor_update` (100B):
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 8B | `id` |
+| 8 | 64B | `op_params[16]` |
+| 72 | 8B | `data` |
+| 80 | 16B | `nb[4]` |
+| 96 | 4B | `flags` |
+
+レスポンス: `rsp_size = 0`
+
+#### FLUSH_AND_RECOMPUTE (cmd=24)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 4B | `n_flush` |
+| 4 | 24B × n_flush | `flush_entries[]` |
+| 4 + 24×n_flush | 4B | `device` |
+
+`rdma_msg_flush_entry` (24B):
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 8B | `remote_ptr` |
+| 8 | 8B | `offset` |
+| 16 | 8B | `size` |
+
+レスポンス: `rsp_size = 0`
+
+#### FLUSH_AND_COMPUTE_UPDATE (cmd=25)
+
+リクエスト:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 4B | `n_flush` |
+| 4 | 24B × n_flush | `flush_entries[]` |
+| 4 + 24×n_flush | 4B | `device` |
+| 8 + 24×n_flush | 4B | `n_updates` |
+| 12 + 24×n_flush | 100B × n_updates | `rdma_tensor_update[]` |
+
+レスポンス: `rsp_size = 0`
+
+#### HELLO (cmd=13)
+
+リクエスト: (empty)
+
+レスポンス:
+
+| オフセット | サイズ | フィールド |
+|-----------|--------|----------|
+| 0 | 1B | `major` |
+| 1 | 1B | `minor` |
+| 2 | 1B | `patch` |
+| 3 | 1B | `gdr_available` |
