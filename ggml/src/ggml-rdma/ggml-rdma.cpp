@@ -208,12 +208,15 @@ struct rdma_msg_alloc_buffer_req {
     uint64_t size;
 };
 
+static constexpr uint8_t RDMA_MR_FLAG_GDR = 0x01;
+
 struct rdma_msg_alloc_buffer_rsp {
     uint64_t remote_ptr;
     uint64_t remote_size;
     // RDMA memory region info for direct access
     uint64_t mr_addr;
     uint32_t mr_rkey;
+    uint8_t  mr_flags;  // RDMA_MR_FLAG_GDR if GPUDirect MR
 };
 
 struct rdma_msg_get_alignment_req {
@@ -415,6 +418,8 @@ struct ggml_backend_rdma_buffer_context {
     std::unique_ptr<rdma_staging_buffer> staging;
     // Disable RDMA Write for this buffer after a failure (fall back to Send)
     bool rdma_write_disabled = false;
+    // True if the server registered a GPUDirect MR (not host staging)
+    bool mr_is_gdr = false;
 };
 
 struct graph_cache {
@@ -841,11 +846,13 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 
     // Try RDMA write if we have MR info, staging buffer, base_ptr is valid, and not disabled.
-    // Skip RDMA Write for large buffers (>4GB) — RNIC page table cache can overflow with
+    // Skip RDMA Write for large staging buffers (>4GB) — RNIC page table cache can overflow with
     // multiple large MR registrations, causing remote access errors on some hardware.
+    // GDR MRs are protected by server-side budget, so skip the per-buffer size check.
     static constexpr size_t RDMA_WRITE_MAX_BUFFER_SIZE = (size_t)4 * 1024 * 1024 * 1024; // 4GB
+    bool size_ok = ctx->mr_is_gdr || (ctx->size <= RDMA_WRITE_MAX_BUFFER_SIZE);
     if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr &&
-        !ctx->rdma_write_disabled && ctx->size <= RDMA_WRITE_MAX_BUFFER_SIZE) {
+        !ctx->rdma_write_disabled && size_ok) {
         // Calculate offset within the buffer
         uint64_t buf_offset = (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
 
@@ -893,8 +900,11 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             }
 
             if (write_ok) {
-                // Record dirty region for batch flush before graph_compute
-                g_pending_flushes.add(ctx->remote_ptr, buf_offset, size);
+                // Record dirty region for batch flush before graph_compute.
+                // GDR MRs write directly to GPU VRAM — no staging flush needed.
+                if (!ctx->mr_is_gdr) {
+                    g_pending_flushes.add(ctx->remote_ptr, buf_offset, size);
+                }
 
                 if (RDMA_PROFILE) {
                     uint64_t elapsed = profile_now_us() - t0;
@@ -942,14 +952,11 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         ggml_backend_rdma_buffer_get_base(const_cast<ggml_backend_buffer_t>(buffer));
     }
 
-    // Try RDMA read if we have MR info, staging buffer, and base_ptr is valid
-    // IMPORTANT: When using host staging (no GDR), RDMA Read reads from the staging buffer
-    // which contains stale data from set_tensor, NOT the latest GPU compute results.
-    // After graph_compute, results are in GPU VRAM but the staging buffer is not updated.
-    // So we must skip RDMA Read when GDR is disabled and fall through to Send/Recv,
-    // which calls ggml_backend_tensor_get() on the server (cudaMemcpy D2H).
-    static const bool no_gdr = (std::getenv("GGML_RDMA_NO_GDR") != nullptr);
-    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr && !no_gdr) {
+    // Try RDMA read if we have MR info, staging buffer, and base_ptr is valid.
+    // Only use RDMA Read for GDR MRs (reading directly from GPU VRAM).
+    // Staging MRs contain stale data from set_tensor, NOT the latest GPU compute results,
+    // so RDMA Read would return wrong data. Fall through to Send/Recv instead.
+    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr && ctx->mr_is_gdr) {
         struct ibv_mr * mr = nullptr;
         void * buf = ctx->staging->get_buffer(size, &mr);
         if (buf) {
@@ -1065,6 +1072,8 @@ static ggml_backend_buffer_t ggml_backend_rdma_buffer_type_alloc_buffer(ggml_bac
             response.remote_size,
             std::move(mem_pool),
             std::move(staging),
+            false,  // rdma_write_disabled
+            (response.mr_flags & RDMA_MR_FLAG_GDR) != 0,  // mr_is_gdr
         };
 
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
@@ -1894,6 +1903,14 @@ public:
     rdma_server(std::vector<ggml_backend_t> backends, const char * cache_dir)
         : backends_(std::move(backends)), cache_dir_(cache_dir) {
         stored_graphs_.resize(backends_.size());
+
+        // Initialize GDR budget from environment variable (default: 12 GB)
+        size_t budget_gb = 12;
+        const char * env = std::getenv("GGML_RDMA_GDR_BUDGET_GB");
+        if (env) {
+            budget_gb = std::strtoull(env, nullptr, 10);
+        }
+        gdr_mr_budget_bytes_ = budget_gb * (size_t)1024 * 1024 * 1024;
     }
 
     ~rdma_server() {
@@ -1932,6 +1949,7 @@ public:
         response.remote_size = 0;
         response.mr_addr = 0;
         response.mr_rkey = 0;
+        response.mr_flags = 0;
 
         if (buffer != nullptr) {
             response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
@@ -1940,14 +1958,38 @@ public:
             buffer_device_map_[buffer] = dev_id;
 
             if (gdr_memory_manager::is_available()) {
-                // GDR available: register GPU buffer directly for RDMA access
-                void * base = ggml_backend_buffer_get_base(buffer);
-                int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-                struct ibv_mr * mr = conn->register_memory(base, buffer->size, access_flags);
-                if (mr) {
-                    buffer_mrs_[buffer] = mr;
-                    response.mr_addr = (uint64_t)mr->addr;
-                    response.mr_rkey = mr->rkey;
+                if (gdr_mr_total_bytes_ + buffer->size <= gdr_mr_budget_bytes_) {
+                    // Within GDR budget: register GPU buffer directly for RDMA access
+                    void * base = ggml_backend_buffer_get_base(buffer);
+                    int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+                    struct ibv_mr * mr = conn->register_memory(base, buffer->size, access_flags);
+                    if (mr) {
+                        buffer_mrs_[buffer] = mr;
+                        response.mr_addr = (uint64_t)mr->addr;
+                        response.mr_rkey = mr->rkey;
+                        response.mr_flags = RDMA_MR_FLAG_GDR;
+                        gdr_mr_total_bytes_ += buffer->size;
+                        GGML_LOG_INFO("[server] GDR MR registered: size=%.1f GB, total=%.1f/%.1f GB\n",
+                                      buffer->size / (1024.0 * 1024.0 * 1024.0),
+                                      gdr_mr_total_bytes_ / (1024.0 * 1024.0 * 1024.0),
+                                      gdr_mr_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
+                    } else {
+                        // MR registration failed: fall back to host staging
+                        GGML_LOG_WARN("[server] GDR MR registration failed (size=%zu), falling back to staging\n",
+                                      (size_t)buffer->size);
+                        if (!std::getenv("GGML_RDMA_NO_STAGING")) {
+                            alloc_host_staging(buffer, buffer->size, conn, response);
+                        }
+                    }
+                } else {
+                    // GDR budget exceeded: fall back to host staging
+                    GGML_LOG_INFO("[server] GDR budget exceeded (need %.1f GB, used %.1f/%.1f GB), using staging\n",
+                                  buffer->size / (1024.0 * 1024.0 * 1024.0),
+                                  gdr_mr_total_bytes_ / (1024.0 * 1024.0 * 1024.0),
+                                  gdr_mr_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
+                    if (!std::getenv("GGML_RDMA_NO_STAGING")) {
+                        alloc_host_staging(buffer, buffer->size, conn, response);
+                    }
                 }
             } else if (!std::getenv("GGML_RDMA_NO_STAGING")) {
                 // No GDR: allocate host staging buffer and register it for RDMA Write
@@ -1957,9 +1999,9 @@ public:
             }
 
             void * base = ggml_backend_buffer_get_base(buffer);
-            RDMA_LOG_DBG("[server] Allocated buffer: dev=%u, ptr=%p, base=%p, size=%zu, mr_addr=0x%lx, mr_rkey=0x%x\n",
+            RDMA_LOG_DBG("[server] Allocated buffer: dev=%u, ptr=%p, base=%p, size=%zu, mr_addr=0x%lx, mr_rkey=0x%x, flags=0x%x\n",
                          dev_id, (void*)response.remote_ptr, base, (size_t)response.remote_size,
-                         response.mr_addr, response.mr_rkey);
+                         response.mr_addr, response.mr_rkey, response.mr_flags);
         }
         return true;
     }
@@ -1968,9 +2010,15 @@ public:
         ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
         if (buffers_.find(buffer) == buffers_.end()) return false;
 
-        // Deregister MR
+        // Deregister MR and update GDR budget
         auto mr_it = buffer_mrs_.find(buffer);
         if (mr_it != buffer_mrs_.end()) {
+            // This is a GDR MR (not staging), subtract from budget
+            if (buffer->size <= gdr_mr_total_bytes_) {
+                gdr_mr_total_bytes_ -= buffer->size;
+            } else {
+                gdr_mr_total_bytes_ = 0;
+            }
             conn->deregister_memory(mr_it->second);
             buffer_mrs_.erase(mr_it);
         }
@@ -2801,6 +2849,10 @@ private:
     std::unordered_map<ggml_backend_buffer_t, uint32_t> buffer_device_map_;
     std::unordered_map<ggml_backend_buffer_t, host_staging_info> staging_buffers_;
 
+    // GDR budget tracking: total GPU MR bytes registered and budget limit
+    size_t gdr_mr_total_bytes_ = 0;
+    size_t gdr_mr_budget_bytes_ = 0;
+
     std::vector<stored_graph> stored_graphs_;
 };
 
@@ -2825,6 +2877,11 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
     printf("  GPUDirect RDMA : %s\n", gdr_memory_manager::is_available() ? "available" : "not available");
+    if (gdr_memory_manager::is_available()) {
+        const char * budget_env = std::getenv("GGML_RDMA_GDR_BUDGET_GB");
+        size_t budget_gb = budget_env ? std::strtoull(budget_env, nullptr, 10) : 12;
+        printf("  GDR budget     : %zu GB\n", budget_gb);
+    }
     printf("Devices:\n");
 
     for (size_t i = 0; i < n_devices; i++) {

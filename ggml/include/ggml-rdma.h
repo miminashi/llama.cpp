@@ -8,7 +8,7 @@ extern "C" {
 
 #define RDMA_PROTO_MAJOR_VERSION    1
 #define RDMA_PROTO_MINOR_VERSION    3
-#define RDMA_PROTO_PATCH_VERSION    0
+#define RDMA_PROTO_PATCH_VERSION    1
 #define GGML_RDMA_MAX_SERVERS       16
 
 // Backend API

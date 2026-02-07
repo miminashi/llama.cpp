@@ -279,6 +279,7 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 GGML_RDMA_NO_GDR=1 \
 |---------|------|----------|
 | `GGML_RDMA_SERVERS` | RDMA サーバーリスト (host:port) | 未設定 |
 | `GGML_RDMA_NO_GDR` | `1` で GPUDirect RDMA を無効化 | 未設定 (GDR有効) |
+| `GGML_RDMA_GDR_BUDGET_GB` | GPUDirect MR 登録の合計サイズ上限 (GB)。超過分はホストステージングにフォールバック | 12 |
 | `GGML_RDMA_NO_STAGING` | `1` でホストステージングバッファを無効化 (Send/Recvフォールバック) | 未設定 |
 | `GGML_RDMA_PROFILE` | `1` でクライアント側プロファイリング有効化 | 未設定 |
 | `GGML_RDMA_DEBUG` | `1` でデバッグログ出力 | 未設定 |
