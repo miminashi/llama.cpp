@@ -744,6 +744,12 @@ static bool check_server_version(rdma_connection * conn) {
 
 // Tensor serialization
 
+static void ggml_backend_rdma_buffer_free_buffer(ggml_backend_buffer_t buffer); // forward declaration
+
+static bool ggml_backend_buffer_is_rdma(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_rdma_buffer_free_buffer;
+}
+
 static rdma_tensor serialize_tensor(const ggml_tensor * tensor) {
     rdma_tensor result;
     if (!tensor) {
@@ -754,16 +760,12 @@ static rdma_tensor serialize_tensor(const ggml_tensor * tensor) {
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
 
-    // Check if buffer is RDMA buffer
-    if (tensor->buffer) {
-        ggml_backend_buffer_t buffer = tensor->buffer;
-        // Check buffer type via comparing free function pointer
-        if (buffer->context) {
-            ggml_backend_rdma_buffer_context * ctx = (ggml_backend_rdma_buffer_context *)buffer->context;
-            result.buffer = ctx->remote_ptr;
-        } else {
-            result.buffer = 0;
-        }
+    // Check if buffer is RDMA buffer — only cast to RDMA context if verified
+    // Non-RDMA buffers (e.g. CUDA) have different context types, so blind casting
+    // would read garbage values for remote_ptr, corrupting graph computation.
+    if (tensor->buffer && ggml_backend_buffer_is_rdma(tensor->buffer)) {
+        ggml_backend_rdma_buffer_context * ctx = (ggml_backend_rdma_buffer_context *)tensor->buffer->context;
+        result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
     } else {
         result.buffer = 0;
     }
@@ -941,10 +943,13 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 
     // Try RDMA read if we have MR info, staging buffer, and base_ptr is valid
-    // Note: When using host staging (no GDR), RDMA Read reads from the staging buffer
-    // which may not have the latest GPU data (only set_tensor data is there).
-    // For GDR, this reads directly from GPU memory.
-    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr) {
+    // IMPORTANT: When using host staging (no GDR), RDMA Read reads from the staging buffer
+    // which contains stale data from set_tensor, NOT the latest GPU compute results.
+    // After graph_compute, results are in GPU VRAM but the staging buffer is not updated.
+    // So we must skip RDMA Read when GDR is disabled and fall through to Send/Recv,
+    // which calls ggml_backend_tensor_get() on the server (cudaMemcpy D2H).
+    static const bool no_gdr = (std::getenv("GGML_RDMA_NO_GDR") != nullptr);
+    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr && !no_gdr) {
         struct ibv_mr * mr = nullptr;
         void * buf = ctx->staging->get_buffer(size, &mr);
         if (buf) {
@@ -990,27 +995,18 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 }
 
 static bool ggml_backend_rdma_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
-    // Check if both tensors are on RDMA buffers with same connection
-    if (!src->buffer || !dst->buffer) {
-        return false;
-    }
-
-    ggml_backend_rdma_buffer_context * src_ctx = (ggml_backend_rdma_buffer_context *)src->buffer->context;
-    ggml_backend_rdma_buffer_context * dst_ctx = (ggml_backend_rdma_buffer_context *)dst->buffer->context;
-
-    if (src_ctx->conn != dst_ctx->conn) {
-        return false;
-    }
-
-    ggml_backend_rdma_buffer_context * ctx = (ggml_backend_rdma_buffer_context *)buffer->context;
-    rdma_msg_copy_tensor_req request;
-    request.src = serialize_tensor(src);
-    request.dst = serialize_tensor(dst);
-    rdma_msg_copy_tensor_rsp response;
-    bool status = send_rdma_cmd_with_rsp(ctx->conn.get(), RDMA_CMD_COPY_TENSOR,
-                                          &request, sizeof(request), &response, sizeof(response));
-    RDMA_STATUS_ASSERT(status);
-    return response.result;
+    // Disable server-side copy_tensor and always use get_tensor+set_tensor fallback.
+    // Server-side copy_tensor (GPU-to-GPU via cudaMemcpyPeer) produces correct data at the
+    // destination buffer, but the graph cache's tensor pointers reference different memory
+    // than the copy destination, causing graph_recompute to read stale data.
+    // The get_tensor+set_tensor fallback goes through the normal set_tensor path which
+    // correctly updates the data that graph_recompute references.
+    // Performance impact is minimal (~3% generation speed) since only inter-layer boundary
+    // tensors (norm, l_out) are copied between devices.
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(src);
+    GGML_UNUSED(dst);
+    return false;
 }
 
 static void ggml_backend_rdma_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -2083,8 +2079,12 @@ public:
             GGML_LOG_ERROR("[rdma_server] error deserializing tensor in get_tensor\n");
             return false;
         }
-        RDMA_LOG_DBG("[rdma_server] get_tensor: buffer=%p, data=%p, offset=%" PRIu64 ", size=%" PRIu64 "\n",
-                     (void*)tensor->buffer, tensor->data, request.offset, request.size);
+        {
+            auto dit = buffer_device_map_.find(tensor->buffer);
+            uint32_t dev = dit != buffer_device_map_.end() ? dit->second : 9999;
+            fprintf(stderr, "[rdma_server] get_tensor: buffer=%p (dev=%u), data=%p, offset=%" PRIu64 ", size=%" PRIu64 "\n",
+                     (void*)tensor->buffer, dev, tensor->data, request.offset, request.size);
+        }
 
         // Validate data region using server-side resolved address (not client's mmap address)
         const size_t p0 = (size_t)ggml_backend_buffer_get_base(tensor->buffer);
