@@ -413,6 +413,8 @@ struct ggml_backend_rdma_buffer_context {
     std::unique_ptr<rdma_memory_pool> mem_pool;
     // Persistent staging buffer for set_tensor/get_tensor RDMA transfers
     std::unique_ptr<rdma_staging_buffer> staging;
+    // Disable RDMA Write for this buffer after a failure (fall back to Send)
+    bool rdma_write_disabled = false;
 };
 
 struct graph_cache {
@@ -836,29 +838,59 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         ggml_backend_rdma_buffer_get_base(buffer);
     }
 
-    // Try RDMA write if we have MR info, staging buffer, and base_ptr is valid
-    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr) {
-        struct ibv_mr * mr = nullptr;
-        void * buf = ctx->staging->get_buffer(size, &mr);
-        if (buf) {
-            memcpy(buf, data, size);
+    // Try RDMA write if we have MR info, staging buffer, base_ptr is valid, and not disabled.
+    // Skip RDMA Write for large buffers (>4GB) — RNIC page table cache can overflow with
+    // multiple large MR registrations, causing remote access errors on some hardware.
+    static constexpr size_t RDMA_WRITE_MAX_BUFFER_SIZE = (size_t)4 * 1024 * 1024 * 1024; // 4GB
+    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr &&
+        !ctx->rdma_write_disabled && ctx->size <= RDMA_WRITE_MAX_BUFFER_SIZE) {
+        // Calculate offset within the buffer
+        uint64_t buf_offset = (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
 
-            // Calculate offset within the buffer
-            uint64_t buf_offset = (reinterpret_cast<uint64_t>(tensor->data) - reinterpret_cast<uint64_t>(ctx->base_ptr)) + offset;
+        // Bounds check: skip RDMA write if offset is outside buffer (e.g. mmap addresses)
+        if (buf_offset + size > ctx->size) {
+            RDMA_LOG_DBG("[rdma_set_tensor] buf_offset out of bounds (tensor=%p, base=%p, buf_offset=%lu, size=%zu, buf_size=%zu), falling back to send\n",
+                         tensor->data, ctx->base_ptr, (unsigned long)buf_offset, size, ctx->size);
+        } else {
+            // Chunk large transfers to avoid RDMA hardware limits
+            static constexpr size_t RDMA_WRITE_CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
+            const uint8_t * src = static_cast<const uint8_t *>(data);
+            size_t remaining = size;
+            uint64_t cur_buf_offset = buf_offset;
+            bool write_ok = true;
 
-            remote_memory_info remote;
-            remote.addr = ctx->mr_addr + buf_offset;
-            remote.rkey = ctx->mr_rkey;
-            remote.size = size;
-
-            // Lock op_mutex_ to protect the RDMA Write as an atomic operation
+            // Lock op_mutex_ for the entire chunked transfer
             std::lock_guard<std::recursive_mutex> op_lock(ctx->conn->op_mutex_);
 
-            RDMA_LOG_DBG("[rdma_set_tensor] About to RDMA write: remote.addr=0x%lx, base_ptr=%p, tensor->data=%p, size=%zu\n",
-                         remote.addr, ctx->base_ptr, tensor->data, size);
-            if (ctx->conn->rdma_write(buf, size, mr, remote, true)) {
-                RDMA_LOG_DBG("[rdma_set_tensor] RDMA write succeeded\n");
+            while (remaining > 0) {
+                size_t chunk = std::min(remaining, RDMA_WRITE_CHUNK_SIZE);
 
+                struct ibv_mr * mr = nullptr;
+                void * buf = ctx->staging->get_buffer(chunk, &mr);
+                if (!buf) {
+                    write_ok = false;
+                    break;
+                }
+                memcpy(buf, src, chunk);
+
+                remote_memory_info remote;
+                remote.addr = ctx->mr_addr + cur_buf_offset;
+                remote.rkey = ctx->mr_rkey;
+                remote.size = chunk;
+
+                RDMA_LOG_DBG("[rdma_set_tensor] RDMA write: remote.addr=0x%lx, buf_offset=%lu, chunk=%zu/%zu\n",
+                             (unsigned long)remote.addr, (unsigned long)cur_buf_offset, chunk, size);
+                if (!ctx->conn->rdma_write(buf, chunk, mr, remote, true)) {
+                    write_ok = false;
+                    break;
+                }
+
+                src += chunk;
+                cur_buf_offset += chunk;
+                remaining -= chunk;
+            }
+
+            if (write_ok) {
                 // Record dirty region for batch flush before graph_compute
                 g_pending_flushes.add(ctx->remote_ptr, buf_offset, size);
 
@@ -871,7 +903,10 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 }
                 return;
             }
-            RDMA_LOG_DBG("[rdma_set_tensor] RDMA write failed, falling back\n");
+            // RDMA Write failed — disable for this buffer and fall back to send.
+            // This prevents repeated failures that destroy the QP.
+            ctx->rdma_write_disabled = true;
+            GGML_LOG_WARN("[rdma_set_tensor] RDMA write failed (size=%zu), disabling RDMA Write for this buffer\n", size);
         }
     }
 
@@ -2020,11 +2055,11 @@ public:
         RDMA_LOG_DBG("[rdma_server] set_tensor: buffer=%p, data=%p, offset=%" PRIu64 ", size=%zu\n",
                      (void*)tensor->buffer, tensor->data, offset, size);
 
-        // Validate data region
+        // Validate data region using server-side resolved address (not client's mmap address)
         const size_t p0 = (size_t)ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 ||
-            size > (p1 - in_tensor->data - offset)) {
+        if ((size_t)tensor->data + offset < p0 || (size_t)tensor->data + offset >= p1 ||
+            size > (p1 - (size_t)tensor->data - offset)) {
             GGML_LOG_ERROR("[rdma_server] set_tensor: out of bounds\n");
             return false;
         }
@@ -2051,12 +2086,12 @@ public:
         RDMA_LOG_DBG("[rdma_server] get_tensor: buffer=%p, data=%p, offset=%" PRIu64 ", size=%" PRIu64 "\n",
                      (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
-        // Validate data region
+        // Validate data region using server-side resolved address (not client's mmap address)
         const size_t p0 = (size_t)ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-        if (request.tensor.data + request.offset < p0 ||
-            request.tensor.data + request.offset >= p1 ||
-            request.size > (p1 - request.tensor.data - request.offset)) {
+        if ((size_t)tensor->data + request.offset < p0 ||
+            (size_t)tensor->data + request.offset >= p1 ||
+            request.size > (p1 - (size_t)tensor->data - request.offset)) {
             GGML_LOG_ERROR("[rdma_server] get_tensor: out of bounds\n");
             return false;
         }
