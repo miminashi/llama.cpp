@@ -335,3 +335,28 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 GGML_RDMA_NO_GDR=1 \
 - 各ステップで `llama-bench` または `llama-cli` によるベンチマーク実行
 - レポートは `report/` ディレクトリに `REPORT.md` のフォーマットに従って記録
 - 性能数値は Prompt t/s と Generation t/s の両方を計測
+
+### 11GPU クラスタテストの必須ルール
+
+- **最終テストには必ず GLM-4.7 (IQ2_M) を使用すること**
+- 作業中の動作確認や回帰テストで小さいモデル (qwen2.5-0.5b, gpt-oss-20b 等) を使うのは OK
+- ただし、変更の最終検証は必ず GLM-4.7 を 11GPU (7C+4R) 構成で実行し、正常な推論出力と性能を確認すること
+- GLM-4.7 テストコマンド:
+
+```bash
+# サーバー起動 (2号機)
+ssh 192.168.100.2 "LD_LIBRARY_PATH=/home/ubuntu/projects/llama.cpp/build/bin \
+  nohup /home/ubuntu/projects/llama.cpp/build/bin/rdma-server -H 0.0.0.0 -p 50051 \
+  > /tmp/rdma-server.log 2>&1 &"
+
+# 推論 (1号機)
+GGML_RDMA_SERVERS=192.168.100.2:50051 LD_LIBRARY_PATH=build/bin \
+  build/bin/llama-cli \
+  -m /tmp/GLM-4.7-IQ2_M/GLM-4.7-UD-IQ2_M-00001-of-00003.gguf \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -c 2048 -n 50 --seed 42 \
+  -p 'The capital of France is' \
+  --no-warmup --single-turn --simple-io --log-file /tmp/llama-cli.log
+```
+
+- 期待値: Prompt ≈ 6.4 t/s, Generation ≈ 6.8 t/s (GDR 有効時)
