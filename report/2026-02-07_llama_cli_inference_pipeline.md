@@ -7,7 +7,7 @@
 | 項目 | 値 |
 |------|-----|
 | 対象ファイル数 | 10 |
-| Mermaid図 | 17枚 |
+| Mermaid図 | 18枚 |
 | 対象アーキテクチャ | Llama系 (Transformer Decoder) |
 
 ---
@@ -397,6 +397,74 @@ llama_batch {
 | 計算量 | O(n² × d) | O(n × d) |
 | ボトルネック | 計算 (Compute bound) | メモリ帯域 (Memory bound) |
 | RDMA転送量 | 大 (全重みテンソル) | 小 (アクティベーションのみ) |
+
+### スペキュレーティブデコーディング
+
+通常の Generation では1トークンずつ逐次生成するため、ターゲットモデルの forward pass がボトルネックになる。**スペキュレーティブデコーディング**は、小型の**ドラフトモデル**で複数トークンを先読み (投機的に生成) し、ターゲットモデルで一括検証することで生成速度を向上させる手法である。
+
+```mermaid
+sequenceDiagram
+    participant DFT as ドラフトモデル<br/>(小型・高速)
+    participant BATCH as バッチ構築
+    participant TGT as ターゲットモデル<br/>(大型・高精度)
+    participant VERIFY as 検証・受理
+
+    Note over DFT: 直前の確定トークンから<br/>K個のドラフトトークンを生成
+    DFT->>BATCH: [draft_1, draft_2, ..., draft_K]
+
+    Note over BATCH: アンカー + ドラフト K個を<br/>1つのバッチにまとめる
+    BATCH->>TGT: llama_decode(batch)
+
+    Note over TGT: K+1 位置の logits を<br/>1回の forward pass で計算
+    TGT->>VERIFY: logits[0..K]
+
+    Note over VERIFY: 各位置でターゲットモデルの<br/>サンプリング結果とドラフトを比較
+    alt 全ドラフト一致
+        VERIFY-->>VERIFY: K+1 トークン確定 (ドラフト K個 + 追加1個)
+    else 途中で不一致 (位置 i)
+        VERIFY-->>VERIFY: i+1 トークン確定 (一致分 + ターゲットのサンプル)
+    end
+```
+
+#### 動作の流れ
+
+1. **ドラフト生成** (`common_speculative_draft`, `common/speculative.cpp:958`):
+   - ドラフトモデルが最大 K 個 (通常 8 個) のトークンを高速に生成
+   - 信頼度 (`p_min`) が閾値を下回ると途中で打ち切り
+   - ドラフトモデル以外にも N-gram ベースの予測が利用可能
+
+2. **バッチ構築** (`server-context.cpp:2057-2079`):
+   - アンカートークン (直前の確定トークン) + ドラフト K 個を1つのバッチに追加
+   - 全トークンに `logits=true` を設定し、各位置の logits を取得
+
+3. **一括検証** (`llama_decode`):
+   - ターゲットモデルが1回の forward pass で全 K+1 位置の logits を計算
+   - 通常の逐次生成では K+1 回の forward pass が必要なところを1回に削減
+
+4. **受理判定** (`common_sampler_sample_and_accept_n`, `common/sampling.cpp:521`):
+   - 各位置でターゲットモデルの logits からサンプリングし、ドラフトトークンと比較
+   - 一致すれば次の位置に進む。不一致が発生した時点で停止
+   - 全ドラフトが一致した場合、さらに1トークン追加サンプリング
+
+5. **状態更新** (`server-context.cpp:2799-2811`):
+   - 受理されたトークンを KV キャッシュに反映
+   - 不一致以降のドラフトトークンは KV キャッシュから削除 (`llama_memory_seq_rm`)
+   - 受理されたトークンを全てクライアントに出力
+
+#### 性能への影響
+
+- **最良ケース**: ドラフト K 個が全て一致 → K+1 トークン/forward pass (K+1倍の速度向上)
+- **最悪ケース**: 最初のドラフトが不一致 → 1 トークン/forward pass (通常と同等)
+- ドラフトモデルの品質とターゲットモデルの類似度が受理率を決定する
+- `slot.n_draft_accepted / slot.n_draft_total` で受理率を追跡
+
+#### 対応するドラフト方式
+
+| 方式 | 説明 |
+|------|------|
+| `DRAFT` | 小型ドラフトモデルによる生成 (`--model-draft` で指定) |
+| `NGRAM_SIMPLE` | N-gram 統計に基づく予測 |
+| `NGRAM_CACHE` | N-gram キャッシュルックアップ |
 
 ---
 
