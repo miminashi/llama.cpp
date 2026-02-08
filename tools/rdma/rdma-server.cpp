@@ -8,6 +8,7 @@
 #  define DIRECTORY_SEPARATOR '/'
 #  include <unistd.h>
 #  include <sys/stat.h>
+#  include <csignal>
 #endif
 
 #include <string>
@@ -16,6 +17,18 @@
 #include <algorithm>
 #include <thread>
 #include <regex>
+
+static volatile sig_atomic_t g_server_shutdown = 0;
+static decltype(ggml_backend_rdma_stop_server) * g_stop_server_fn = nullptr;
+
+static void signal_handler(int signum) {
+    g_server_shutdown = 1;
+    // Stop the server to unblock accept_connection()
+    if (g_stop_server_fn) {
+        g_stop_server_fn();
+    }
+    (void)signum;
+}
 
 static bool fs_create_directory_with_parents(const std::string & path) {
 #ifdef _WIN32
@@ -204,6 +217,15 @@ static std::vector<ggml_backend_dev_t> get_devices(const rdma_server_params & pa
 }
 
 int main(int argc, char * argv[]) {
+    // Setup signal handlers for graceful shutdown
+#ifndef _WIN32
+    struct sigaction sa = {};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+#endif
+
     ggml_backend_load_all();
 
     rdma_server_params params;
@@ -252,6 +274,9 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "Failed to obtain RDMA backend start server function\n");
         return 1;
     }
+
+    // Get stop_server function for signal handler
+    g_stop_server_fn = (decltype(ggml_backend_rdma_stop_server)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rdma_stop_server");
 
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
     return 0;

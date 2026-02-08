@@ -38,6 +38,9 @@ GGML_BACKEND_API void ggml_backend_rdma_get_device_memory(const char * endpoint,
 GGML_BACKEND_API void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_dir,
                                                       size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
+// Stop RDMA server (can be called from signal handler)
+GGML_BACKEND_API void ggml_backend_rdma_stop_server(void);
+
 // Backend registration
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rdma_reg(void);
 

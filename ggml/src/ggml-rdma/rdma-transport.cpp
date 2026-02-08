@@ -715,11 +715,25 @@ rdma_connection_manager::~rdma_connection_manager() {
     stop_server();
 }
 
-std::shared_ptr<rdma_connection> rdma_connection_manager::get_connection(const std::string & endpoint) {
+std::shared_ptr<rdma_connection> rdma_connection_manager::get_connection(const std::string & key) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
 
+    // Extract endpoint from key (strip "#device_idx" suffix if present)
+    std::string endpoint = key;
+    auto hash_pos = key.find('#');
+    if (hash_pos != std::string::npos) {
+        endpoint = key.substr(0, hash_pos);
+    }
+
+    // Determine cache key: shared mode (default) uses endpoint only, per-device uses full key.
+    // Per-device connections create separate QPs per device, which can cause RNIC MTT cache
+    // overflow on ConnectX-4 with large models (>40GB total MR). Use GGML_RDMA_PER_DEVICE_CONN=1
+    // to enable per-device connections on newer NICs (ConnectX-6+) with larger MTT caches.
+    static bool per_device_conn = (std::getenv("GGML_RDMA_PER_DEVICE_CONN") != nullptr);
+    const std::string & cache_key = per_device_conn ? key : endpoint;
+
     // Check if connection already exists
-    auto it = connections_.find(endpoint);
+    auto it = connections_.find(cache_key);
     if (it != connections_.end()) {
         if (it->second && it->second->is_connected()) {
             return it->second;
@@ -741,7 +755,7 @@ std::shared_ptr<rdma_connection> rdma_connection_manager::get_connection(const s
         return nullptr;
     }
 
-    connections_[endpoint] = conn;
+    connections_[cache_key] = conn;
     return conn;
 }
 
@@ -809,6 +823,8 @@ void rdma_connection_manager::stop_server() {
         return;
     }
 
+    server_running_ = false;
+
     if (server_id_) {
         rdma_destroy_id(server_id_);
         server_id_ = nullptr;
@@ -818,8 +834,6 @@ void rdma_connection_manager::stop_server() {
         rdma_destroy_event_channel(server_channel_);
         server_channel_ = nullptr;
     }
-
-    server_running_ = false;
 }
 
 std::shared_ptr<rdma_connection> rdma_connection_manager::accept_connection() {
@@ -827,43 +841,76 @@ std::shared_ptr<rdma_connection> rdma_connection_manager::accept_connection() {
         return nullptr;
     }
 
-    // Wait for connection request
-    struct rdma_cm_event * event = nullptr;
-    if (rdma_get_cm_event(server_channel_, &event) != 0) {
-        GGML_LOG_ERROR("[rdma_connection_manager] Failed to get CM event: %s\n", strerror(errno));
-        return nullptr;
-    }
+    while (true) {
+        // Wait for connection request
+        struct rdma_cm_event * event = nullptr;
+        if (rdma_get_cm_event(server_channel_, &event) != 0) {
+            if (!server_running_) {
+                // Server was stopped (e.g. signal handler)
+                return nullptr;
+            }
+            GGML_LOG_ERROR("[rdma_connection_manager] Failed to get CM event: %s\n", strerror(errno));
+            return nullptr;
+        }
 
-    if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
-        GGML_LOG_ERROR("[rdma_connection_manager] Unexpected event: %d\n", event->event);
+        // Skip non-connect events (e.g. DISCONNECTED from previous client)
+        if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+            RDMA_LOG_DBG("[rdma_connection_manager] Skipping CM event: %s (%d)\n",
+                         rdma_event_str(event->event), event->event);
+            rdma_ack_cm_event(event);
+            continue;
+        }
+
+        struct rdma_cm_id * client_id = event->id;
         rdma_ack_cm_event(event);
-        return nullptr;
+
+        // Create connection and accept
+        auto conn = std::make_shared<rdma_connection>();
+        if (!conn->accept(client_id, server_config_)) {
+            rdma_destroy_id(client_id);
+            return nullptr;
+        }
+
+        // Wait for ESTABLISHED event for this specific connection.
+        // With multi-connection setups, we may receive events for other connections
+        // (ESTABLISHED, DISCONNECTED, etc.) - skip those and continue waiting.
+        bool established = false;
+        while (true) {
+            if (rdma_get_cm_event(server_channel_, &event) != 0) {
+                if (!server_running_) {
+                    return nullptr;
+                }
+                GGML_LOG_ERROR("[rdma_connection_manager] Failed to get established event: %s\n", strerror(errno));
+                return nullptr;
+            }
+
+            if (event->event == RDMA_CM_EVENT_ESTABLISHED && event->id == client_id) {
+                rdma_ack_cm_event(event);
+                established = true;
+                break;
+            }
+
+            // Check if this connection was rejected before acking
+            bool is_failure = (event->id == client_id &&
+                (event->event == RDMA_CM_EVENT_REJECTED ||
+                 event->event == RDMA_CM_EVENT_CONNECT_ERROR));
+
+            // Skip events for other connections (ESTABLISHED, DISCONNECTED, etc.)
+            RDMA_LOG_DBG("[rdma_connection_manager] Skipping CM event while waiting for ESTABLISHED: %s (%d) for id %p (want %p)\n",
+                         rdma_event_str(event->event), event->event, (void*)event->id, (void*)client_id);
+            rdma_ack_cm_event(event);
+
+            // If this connection was rejected, give up on it
+            if (is_failure) {
+                break;
+            }
+        }
+
+        if (established) {
+            return conn;
+        }
+        // Connection failed, try accepting again
     }
-
-    struct rdma_cm_id * client_id = event->id;
-    rdma_ack_cm_event(event);
-
-    // Create connection and accept
-    auto conn = std::make_shared<rdma_connection>();
-    if (!conn->accept(client_id, server_config_)) {
-        rdma_destroy_id(client_id);
-        return nullptr;
-    }
-
-    // Wait for established event
-    if (rdma_get_cm_event(server_channel_, &event) != 0) {
-        GGML_LOG_ERROR("[rdma_connection_manager] Failed to get established event: %s\n", strerror(errno));
-        return nullptr;
-    }
-
-    if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
-        GGML_LOG_ERROR("[rdma_connection_manager] Connection not established: %d\n", event->event);
-        rdma_ack_cm_event(event);
-        return nullptr;
-    }
-    rdma_ack_cm_event(event);
-
-    return conn;
 }
 
 } // namespace ggml_rdma

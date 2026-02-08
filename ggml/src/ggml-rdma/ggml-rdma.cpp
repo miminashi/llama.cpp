@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <atomic>
+#include <thread>
 
 using namespace ggml_rdma;
 
@@ -374,7 +375,21 @@ struct pending_flush_list {
         return dirty_buffers.empty();
     }
 };
-static pending_flush_list g_pending_flushes;
+// Per-connection pending flushes: each connection (= device) has its own flush list.
+// Keyed by connection pointer for fast lookup from both buffer and backend contexts.
+static std::unordered_map<rdma_connection *, std::shared_ptr<pending_flush_list>> g_conn_pending_flushes;
+static std::mutex g_conn_pending_flushes_mutex;
+
+static std::shared_ptr<pending_flush_list> get_pending_flushes(rdma_connection * conn) {
+    std::lock_guard<std::mutex> lock(g_conn_pending_flushes_mutex);
+    auto it = g_conn_pending_flushes.find(conn);
+    if (it != g_conn_pending_flushes.end()) {
+        return it->second;
+    }
+    auto pf = std::make_shared<pending_flush_list>();
+    g_conn_pending_flushes[conn] = pf;
+    return pf;
+}
 
 #pragma pack(pop)
 
@@ -903,7 +918,7 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 // Record dirty region for batch flush before graph_compute.
                 // GDR MRs write directly to GPU VRAM — no staging flush needed.
                 if (!ctx->mr_is_gdr) {
-                    g_pending_flushes.add(ctx->remote_ptr, buf_offset, size);
+                    get_pending_flushes(ctx->conn.get())->add(ctx->remote_ptr, buf_offset, size);
                 }
 
                 if (RDMA_PROFILE) {
@@ -1047,9 +1062,10 @@ static ggml_backend_buffer_t ggml_backend_rdma_buffer_type_alloc_buffer(ggml_bac
     rdma_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rdma_msg_alloc_buffer_rsp response;
 
-    auto conn = get_connection(buft_ctx->endpoint);
+    std::string conn_key = buft_ctx->endpoint + "#" + std::to_string(buft_ctx->device);
+    auto conn = get_connection(conn_key);
     if (!conn) {
-        GGML_LOG_ERROR("[rdma] Failed to connect to %s\n", buft_ctx->endpoint.c_str());
+        GGML_LOG_ERROR("[rdma] Failed to connect to %s (device %u)\n", buft_ctx->endpoint.c_str(), buft_ctx->device);
         return nullptr;
     }
 
@@ -1165,7 +1181,8 @@ static size_t ggml_backend_rdma_buffer_type_get_alloc_size(ggml_backend_buffer_t
         }
 
         // Cache miss - need RPC
-        auto conn = get_connection(buft_ctx->endpoint);
+        std::string conn_key = buft_ctx->endpoint + "#" + std::to_string(buft_ctx->device);
+        auto conn = get_connection(conn_key);
         if (!conn) {
             return ggml_nbytes(tensor);
         }
@@ -1277,8 +1294,8 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
 
     GGML_ASSERT(cgraph->n_nodes > 0);
 
-    // Drain pending flushes (from set_tensor RDMA Writes)
-    auto pending = g_pending_flushes.drain();
+    // Drain pending flushes for this device's connection only
+    auto pending = get_pending_flushes(ctx->conn.get())->drain();
     uint32_t n_flush = pending.size();
 
     bool reuse = ctx->gc.is_cached(cgraph);
@@ -1464,7 +1481,8 @@ static const char * ggml_backend_rdma_device_get_description(ggml_backend_dev_t 
 static void ggml_backend_rdma_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_rdma_device_context * ctx = (ggml_backend_rdma_device_context *)dev->context;
 
-    auto conn = get_connection(ctx->endpoint);
+    std::string conn_key = ctx->endpoint + "#" + std::to_string(ctx->device);
+    auto conn = get_connection(conn_key);
     if (!conn) {
         *free = 0;
         *total = 0;
@@ -1584,6 +1602,9 @@ static void * ggml_backend_rdma_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_rdma_start_server") == 0) {
         return (void *)ggml_backend_rdma_start_server;
     }
+    if (strcmp(name, "ggml_backend_rdma_stop_server") == 0) {
+        return (void *)ggml_backend_rdma_stop_server;
+    }
     if (strcmp(name, "ggml_backend_rdma_enable_gdr") == 0) {
         return (void *)ggml_backend_rdma_enable_gdr;
     }
@@ -1603,9 +1624,11 @@ static ggml_backend_reg_i ggml_backend_rdma_reg_interface = {
 // Public API implementations
 
 ggml_backend_t ggml_backend_rdma_init(const char * endpoint, uint32_t device) {
-    auto conn = get_connection(endpoint);
+    // Per-device connection: each device gets its own QP to avoid op_mutex_ contention
+    std::string conn_key = std::string(endpoint) + "#" + std::to_string(device);
+    auto conn = get_connection(conn_key);
     if (!conn) {
-        GGML_LOG_ERROR("[rdma] Failed to connect to %s\n", endpoint);
+        GGML_LOG_ERROR("[rdma] Failed to connect to %s (device %u)\n", endpoint, device);
         return nullptr;
     }
 
@@ -1651,9 +1674,11 @@ ggml_backend_buffer_type_t ggml_backend_rdma_buffer_type(const char * endpoint, 
         return it->second;
     }
 
-    auto conn = get_connection(endpoint);
+    // Per-device connection
+    std::string conn_key = std::string(endpoint) + "#" + std::to_string(device);
+    auto conn = get_connection(conn_key);
     if (!conn) {
-        GGML_LOG_ERROR("[rdma] Failed to connect to %s\n", endpoint);
+        GGML_LOG_ERROR("[rdma] Failed to connect to %s (device %u)\n", endpoint, device);
         return nullptr;
     }
 
@@ -1693,7 +1718,8 @@ ggml_backend_buffer_type_t ggml_backend_rdma_buffer_type(const char * endpoint, 
 }
 
 void ggml_backend_rdma_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
-    auto conn = get_connection(endpoint);
+    std::string conn_key = std::string(endpoint) + "#" + std::to_string(device);
+    auto conn = get_connection(conn_key);
     if (!conn) {
         *free = 0;
         *total = 0;
@@ -1757,7 +1783,9 @@ ggml_backend_reg_t ggml_backend_rdma_reg(void) {
             auto servers = parse_server_list(servers_env);
             for (const auto & server : servers) {
                 GGML_LOG_INFO("[rdma] Adding server from environment: %s\n", server.c_str());
-                auto conn = get_connection(server);
+                // Use device 0 connection for initial discovery
+                std::string conn_key = server + "#0";
+                auto conn = get_connection(conn_key);
                 if (!conn) {
                     GGML_LOG_ERROR("[rdma] Failed to connect to %s\n", server.c_str());
                     continue;
@@ -1806,7 +1834,9 @@ ggml_backend_reg_t ggml_backend_rdma_add_server(const char * endpoint) {
         return it->second;
     }
 
-    auto conn = get_connection(endpoint);
+    // Use device 0 connection for server discovery
+    std::string conn_key = std::string(endpoint) + "#0";
+    auto conn = get_connection(conn_key);
     if (!conn) {
         return nullptr;
     }
@@ -1914,7 +1944,13 @@ public:
     }
 
     ~rdma_server() {
-        // Free staging buffers first (they reference buffer pointers)
+        // Free GDR MRs (GPU buffer memory regions)
+        for (auto & [buf, mr] : buffer_mrs_) {
+            if (mr) ibv_dereg_mr(mr);
+        }
+        buffer_mrs_.clear();
+
+        // Free staging buffers (host pinned memory + MRs)
         for (auto & [buf, info] : staging_buffers_) {
             if (info.mr) ibv_dereg_mr(info.mr);
 #ifdef GGML_RDMA_CUDA
@@ -1925,9 +1961,23 @@ public:
         }
         staging_buffers_.clear();
 
+#ifdef GGML_RDMA_CUDA
+        // Free cross-device GPU allocations from stored graphs
+        for (auto & sg : stored_graphs_) {
+            for (void * ptr : sg.cross_device_allocs) {
+                cudaFree(ptr);
+            }
+            sg.cross_device_allocs.clear();
+        }
+#endif
+
+        // Free GPU buffers
         for (auto buffer : buffers_) {
             ggml_backend_buffer_free(buffer);
         }
+        buffers_.clear();
+
+        gdr_mr_total_bytes_ = 0;
     }
 
     void hello(rdma_msg_hello_rsp & response) {
@@ -1954,11 +2004,14 @@ public:
         if (buffer != nullptr) {
             response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
             response.remote_size = buffer->size;
+
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffers_.insert(buffer);
             buffer_device_map_[buffer] = dev_id;
 
             if (gdr_memory_manager::is_available()) {
-                if (gdr_mr_total_bytes_ + buffer->size <= gdr_mr_budget_bytes_) {
+                size_t gdr_total = gdr_mr_total_bytes_.load();
+                if (gdr_total + buffer->size <= gdr_mr_budget_bytes_) {
                     // Within GDR budget: register GPU buffer directly for RDMA access
                     void * base = ggml_backend_buffer_get_base(buffer);
                     int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -1968,10 +2021,10 @@ public:
                         response.mr_addr = (uint64_t)mr->addr;
                         response.mr_rkey = mr->rkey;
                         response.mr_flags = RDMA_MR_FLAG_GDR;
-                        gdr_mr_total_bytes_ += buffer->size;
+                        size_t new_total = (gdr_mr_total_bytes_ += buffer->size);
                         GGML_LOG_INFO("[server] GDR MR registered: size=%.1f GB, total=%.1f/%.1f GB\n",
                                       buffer->size / (1024.0 * 1024.0 * 1024.0),
-                                      gdr_mr_total_bytes_ / (1024.0 * 1024.0 * 1024.0),
+                                      new_total / (1024.0 * 1024.0 * 1024.0),
                                       gdr_mr_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
                     } else {
                         // MR registration failed: fall back to host staging
@@ -1985,7 +2038,7 @@ public:
                     // GDR budget exceeded: fall back to host staging
                     GGML_LOG_INFO("[server] GDR budget exceeded (need %.1f GB, used %.1f/%.1f GB), using staging\n",
                                   buffer->size / (1024.0 * 1024.0 * 1024.0),
-                                  gdr_mr_total_bytes_ / (1024.0 * 1024.0 * 1024.0),
+                                  gdr_total / (1024.0 * 1024.0 * 1024.0),
                                   gdr_mr_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
                     if (!std::getenv("GGML_RDMA_NO_STAGING")) {
                         alloc_host_staging(buffer, buffer->size, conn, response);
@@ -2007,6 +2060,7 @@ public:
     }
 
     bool free_buffer(const rdma_msg_free_buffer_req & request, rdma_connection * conn) {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
         ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
         if (buffers_.find(buffer) == buffers_.end()) return false;
 
@@ -2014,7 +2068,8 @@ public:
         auto mr_it = buffer_mrs_.find(buffer);
         if (mr_it != buffer_mrs_.end()) {
             // This is a GDR MR (not staging), subtract from budget
-            if (buffer->size <= gdr_mr_total_bytes_) {
+            size_t cur = gdr_mr_total_bytes_.load();
+            if (buffer->size <= cur) {
                 gdr_mr_total_bytes_ -= buffer->size;
             } else {
                 gdr_mr_total_bytes_ = 0;
@@ -2844,15 +2899,19 @@ private:
 
     std::vector<ggml_backend_t> backends_;
     const char * cache_dir_;
+
+    // Buffer management (protected by buffer_mutex_ for multi-threaded access)
+    std::mutex buffer_mutex_;
     std::unordered_set<ggml_backend_buffer_t> buffers_;
     std::unordered_map<ggml_backend_buffer_t, struct ibv_mr *> buffer_mrs_;
     std::unordered_map<ggml_backend_buffer_t, uint32_t> buffer_device_map_;
     std::unordered_map<ggml_backend_buffer_t, host_staging_info> staging_buffers_;
 
     // GDR budget tracking: total GPU MR bytes registered and budget limit
-    size_t gdr_mr_total_bytes_ = 0;
+    std::atomic<size_t> gdr_mr_total_bytes_{0};
     size_t gdr_mr_budget_bytes_ = 0;
 
+    // Per-device stored graphs (indexed by device, each device accessed by one thread)
     std::vector<stored_graph> stored_graphs_;
 };
 
@@ -2918,26 +2977,15 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
 
     printf("RDMA server listening on %s:%d\n", host.c_str(), port);
 
-    // Accept connections
-    while (true) {
-        auto conn = manager.accept_connection();
-        if (!conn) {
-            fprintf(stderr, "Failed to accept connection\n");
-            continue;
-        }
+    // Shared server instance for all client threads
+    auto server = std::make_shared<rdma_server>(backends, cache_dir);
 
-        printf("Accepted RDMA connection from %s\n", conn->get_endpoint().c_str());
-
-        // Handle client in current thread (single-threaded for simplicity)
-        // In production, this should be multi-threaded
-        rdma_server server(backends, cache_dir);
-
+    // Client handler: runs in a separate thread per connection
+    auto handle_client = [&backends](std::shared_ptr<rdma_server> server,
+                                      std::shared_ptr<rdma_connection> conn) {
         // Helper: adaptive response send.
-        // Small responses (<= threshold): single send of [size(8B)|data(NB)].
-        // Large responses (> threshold): two sends for zero-copy.
-        auto send_rsp = [&](const void * data, size_t data_size) -> bool {
+        auto send_rsp = [&conn](const void * data, size_t data_size) -> bool {
             if (data_size <= RDMA_ADAPTIVE_RSP_THRESHOLD) {
-                // Small response: combine size + data in one send
                 uint8_t combined[sizeof(uint64_t) + RDMA_ADAPTIVE_RSP_THRESHOLD];
                 uint64_t sz = data_size;
                 memcpy(combined, &sz, sizeof(sz));
@@ -2946,7 +2994,6 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                 }
                 return conn->send(combined, sizeof(uint64_t) + data_size, nullptr);
             }
-            // Large response: two sends for zero-copy
             uint64_t sz = data_size;
             if (!conn->send(&sz, sizeof(sz), nullptr)) {
                 return false;
@@ -2954,15 +3001,11 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
             return conn->send(data, data_size, nullptr);
         };
 
-        // Helper: send response with no data (rsp_size = 0)
-        auto send_rsp_empty = [&]() -> bool {
+        auto send_rsp_empty = [&conn]() -> bool {
             uint64_t sz = 0;
             return conn->send(&sz, sizeof(sz), nullptr);
         };
 
-        // Process commands
-        // Receive: [cmd(1B) | msg_size(8B)] in one RECV, then [msg_data(NB)] in another.
-        // Reduces 3 recvs to 2 (or 1 if no data).
         const size_t cmd_header_size = 1 + sizeof(uint64_t);
         uint8_t header_buf[1 + sizeof(uint64_t)];
         while (true) {
@@ -2980,7 +3023,6 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
             uint64_t msg_size = 0;
             std::memcpy(&msg_size, header_buf + 1, sizeof(msg_size));
 
-            // Read message data if any
             std::vector<uint8_t> msg_data(msg_size);
             if (msg_size > 0) {
                 if (!conn->recv(msg_data.data(), msg_size, nullptr)) {
@@ -2992,7 +3034,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
             switch (cmd) {
                 case RDMA_CMD_HELLO: {
                     rdma_msg_hello_rsp response;
-                    server.hello(response);
+                    server->hello(response);
                     send_rsp(&response, sizeof(response));
                     break;
                 }
@@ -3006,14 +3048,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_alloc_buffer_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_alloc_buffer_rsp response;
-                    server.alloc_buffer(request, response, conn.get());
+                    server->alloc_buffer(request, response, conn.get());
                     send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_FREE_BUFFER: {
                     rdma_msg_free_buffer_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
-                    server.free_buffer(request, conn.get());
+                    server->free_buffer(request, conn.get());
                     send_rsp_empty();
                     break;
                 }
@@ -3021,7 +3063,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_get_alignment_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_alignment_rsp response;
-                    server.get_alignment(request, response);
+                    server->get_alignment(request, response);
                     send_rsp(&response, sizeof(response));
                     break;
                 }
@@ -3029,7 +3071,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_get_max_size_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_max_size_rsp response;
-                    server.get_max_size(request, response);
+                    server->get_max_size(request, response);
                     send_rsp(&response, sizeof(response));
                     break;
                 }
@@ -3037,14 +3079,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_buffer_get_base_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_buffer_get_base_rsp response;
-                    server.buffer_get_base(request, response);
+                    server->buffer_get_base(request, response);
                     send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_BUFFER_CLEAR: {
                     rdma_msg_buffer_clear_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
-                    server.buffer_clear(request);
+                    server->buffer_clear(request);
                     send_rsp_empty();
                     break;
                 }
@@ -3052,12 +3094,12 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_get_device_memory_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_device_memory_rsp response;
-                    server.get_device_memory(request, response);
+                    server->get_device_memory(request, response);
                     send_rsp(&response, sizeof(response));
                     break;
                 }
                 case RDMA_CMD_SET_TENSOR: {
-                    if (!server.set_tensor(msg_data)) {
+                    if (!server->set_tensor(msg_data)) {
                         fprintf(stderr, "set_tensor failed\n");
                     }
                     send_rsp_empty();
@@ -3067,7 +3109,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_get_tensor_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     std::vector<uint8_t> response;
-                    if (!server.get_tensor(request, response)) {
+                    if (!server->get_tensor(request, response)) {
                         fprintf(stderr, "get_tensor failed\n");
                         send_rsp_empty();
                     } else {
@@ -3079,7 +3121,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_copy_tensor_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_copy_tensor_rsp response;
-                    if (!server.copy_tensor(request, response)) {
+                    if (!server->copy_tensor(request, response)) {
                         fprintf(stderr, "copy_tensor failed\n");
                         response.result = 0;
                     }
@@ -3089,7 +3131,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                 case RDMA_CMD_INIT_TENSOR: {
                     rdma_msg_init_tensor_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
-                    if (!server.init_tensor(request)) {
+                    if (!server->init_tensor(request)) {
                         fprintf(stderr, "init_tensor failed\n");
                     }
                     send_rsp_empty();
@@ -3099,7 +3141,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     rdma_msg_get_alloc_size_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
                     rdma_msg_get_alloc_size_rsp response;
-                    if (!server.get_alloc_size(request, response)) {
+                    if (!server->get_alloc_size(request, response)) {
                         fprintf(stderr, "get_alloc_size failed\n");
                         response.alloc_size = 0;
                     }
@@ -3107,7 +3149,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     break;
                 }
                 case RDMA_CMD_GRAPH_COMPUTE: {
-                    if (!server.graph_compute(msg_data)) {
+                    if (!server->graph_compute(msg_data)) {
                         fprintf(stderr, "graph_compute failed\n");
                     }
                     uint64_t t_rsp = RDMA_PROFILE ? profile_now_us() : 0;
@@ -3123,7 +3165,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                 case RDMA_CMD_GRAPH_RECOMPUTE: {
                     rdma_msg_graph_recompute_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
-                    if (!server.graph_recompute(request)) {
+                    if (!server->graph_recompute(request)) {
                         fprintf(stderr, "graph_recompute failed\n");
                     }
                     uint64_t t_rsp_r = RDMA_PROFILE ? profile_now_us() : 0;
@@ -3137,7 +3179,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     break;
                 }
                 case RDMA_CMD_GRAPH_COMPUTE_UPDATE: {
-                    if (!server.graph_compute_update(msg_data)) {
+                    if (!server->graph_compute_update(msg_data)) {
                         fprintf(stderr, "graph_compute_update failed\n");
                     }
                     uint64_t t_rsp_u = RDMA_PROFILE ? profile_now_us() : 0;
@@ -3153,14 +3195,14 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                 case RDMA_CMD_FLUSH_STAGING: {
                     rdma_msg_flush_staging_req request;
                     memcpy(&request, msg_data.data(), sizeof(request));
-                    if (!server.flush_staging(request)) {
+                    if (!server->flush_staging(request)) {
                         fprintf(stderr, "flush_staging failed\n");
                     }
                     send_rsp_empty();
                     break;
                 }
                 case RDMA_CMD_FLUSH_ALL_STAGING: {
-                    if (!server.flush_all_staging(msg_data)) {
+                    if (!server->flush_all_staging(msg_data)) {
                         fprintf(stderr, "flush_all_staging failed\n");
                     }
                     uint64_t t_rsp_f = RDMA_PROFILE ? profile_now_us() : 0;
@@ -3174,7 +3216,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     break;
                 }
                 case RDMA_CMD_FLUSH_AND_RECOMPUTE: {
-                    if (!server.flush_and_recompute(msg_data)) {
+                    if (!server->flush_and_recompute(msg_data)) {
                         fprintf(stderr, "flush_and_recompute failed\n");
                     }
                     uint64_t t_rsp_fr = RDMA_PROFILE ? profile_now_us() : 0;
@@ -3188,7 +3230,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                     break;
                 }
                 case RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE: {
-                    if (!server.flush_and_compute_update(msg_data)) {
+                    if (!server->flush_and_compute_update(msg_data)) {
                         fprintf(stderr, "flush_and_compute_update failed\n");
                     }
                     uint64_t t_rsp_fu = RDMA_PROFILE ? profile_now_us() : 0;
@@ -3208,12 +3250,48 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
         }
 
         printf("Client disconnected: %s\n", conn->get_endpoint().c_str());
+        conn->disconnect();
+    };
+
+    // Track client threads for cleanup
+    std::vector<std::thread> client_threads;
+
+    // Accept connections (each handled in a separate thread)
+    while (manager.is_server_running()) {
+        auto conn = manager.accept_connection();
+        if (!conn) {
+            if (!manager.is_server_running()) {
+                printf("Server shutting down\n");
+                break;
+            }
+            fprintf(stderr, "Failed to accept connection, retrying...\n");
+            continue;
+        }
+
+        printf("Accepted RDMA connection from %s\n", conn->get_endpoint().c_str());
+
+        // Launch client handler thread
+        client_threads.emplace_back(handle_client, server, std::move(conn));
     }
+
+    // Wait for all client threads to finish
+    for (auto & t : client_threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    // Release shared server before freeing backends
+    server.reset();
 
     // Cleanup
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
+}
+
+void ggml_backend_rdma_stop_server(void) {
+    get_connection_manager().stop_server();
 }
 
 // Dynamic loading support
