@@ -77,7 +77,7 @@ public:
 
     // RDMA Send/Receive (for control messages)
     bool send(const void * data, size_t size, struct ibv_mr * mr = nullptr);
-    bool recv(void * data, size_t size, struct ibv_mr * mr = nullptr);
+    bool recv(void * data, size_t size, struct ibv_mr * mr = nullptr, int timeout_ms = -1);
 
     // Post receive buffer (for async receive)
     bool post_recv(void * data, size_t size, struct ibv_mr * mr, uint64_t wr_id = 0);

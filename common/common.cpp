@@ -1050,12 +1050,16 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
-        llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
+        auto status = llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (status != LLAMA_PARAMS_FIT_STATUS_SUCCESS) {
+            LOG_WRN("%s: fit_params failed (status=%d), falling back to n_ctx=%u\n", __func__, status, params.fit_params_min_ctx);
+            cparams.n_ctx = params.fit_params_min_ctx;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

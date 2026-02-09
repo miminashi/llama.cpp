@@ -9,6 +9,10 @@
 - **ビルド**: llama.cppをビルドする際は、必ず事前に `build` ディレクトリを削除してからビルドすること (`rm -rf build && cmake -B build ...`)
 - **コード転送**: 2号機 (192.168.100.2) にコードを転送する際は、2号機に既に存在するllama.cppのディレクトリを削除したうえで、1号機のコードをコピーすること
 - **実行**: `llama-cli` を実行する際は、必ず `--log-file /tmp/llama-cli.log` オプションを付けること (ユーザが別ターミナルで `tail -f /tmp/llama-cli.log` によりリアルタイムにログを確認できるようにするため)
+- **Bashコマンドに `#` コメント行を含めない**: コメント付きコマンドはパーミッション自動承認が効かないため、コメントは Bash ツールの description パラメータに記載すること
+- **マルチラインコマンドを避ける**: 改行区切りの複数コマンドはパーミッション自動承認が効かない場合がある。`&&` や `;` で1行にまとめるか、複数の Bash 呼び出しに分割すること
+- **SSH コマンドを直接使わない**: `ssh`, `rsync`, `scp` はパーミッション自動承認が効かない (Claude Code の既知の制限)。代わりに `scripts/rdma-*.sh` ラッパースクリプトを `bash scripts/rdma-*.sh` で呼び出すこと
+- **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時に `report/` ディレクトリにレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う
 
 ## プロジェクト目標と現在の状況
 
@@ -110,38 +114,42 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 
 ## ビルド・デプロイ・実行手順
 
+> **重要**: SSH/rsync コマンドは Claude Code のパーミッション自動承認が効かないため、
+> ラッパースクリプト (`scripts/rdma-*.sh`) 経由で実行すること。
+> スクリプトは `bash scripts/rdma-*.sh` で呼び出せば `Bash(bash *)` にマッチして自動承認される。
+
 ### 1号機 (192.168.100.1) でビルド
 
 ```bash
-cd /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend
-rm -rf build
-cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES="60"
-cmake --build build -- -j $(nproc)
+bash scripts/rdma-build.sh local
 ```
 
-### 2号機 (192.168.100.2) へのデプロイ
+### 2号機 (192.168.100.2) へのデプロイ (コード転送 + ビルド)
 
 ```bash
-# 2号機の既存ディレクトリを削除してから転送
-ssh 192.168.100.2 "rm -rf /home/ubuntu/projects/llama.cpp"
-rsync -a --exclude='.git' /home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/ 192.168.100.2:/home/ubuntu/projects/llama.cpp/
+bash scripts/rdma-deploy.sh
+```
 
-# 2号機でビルド
-ssh 192.168.100.2 "cd /home/ubuntu/projects/llama.cpp && rm -rf build && cmake -B build -DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=60 && cmake --build build -- -j \$(nproc)"
+### 両ノードでビルド (1号機ビルド + 2号機デプロイ)
+
+```bash
+bash scripts/rdma-build.sh local && bash scripts/rdma-deploy.sh
+```
+
+### rdma-server 管理 (2号機)
+
+```bash
+bash scripts/rdma-server.sh start    # 起動
+bash scripts/rdma-server.sh stop     # 停止
+bash scripts/rdma-server.sh restart  # 再起動
+bash scripts/rdma-server.sh status   # 状態確認
+bash scripts/rdma-server.sh log      # ログ表示
 ```
 
 > **ビルドコマンドに関する注意:**
 > - `--config Release` は Unix Makefiles ジェネレータでは無視されるため不要（`CMAKE_BUILD_TYPE=Release` は cmake configure 時に自動設定される）
-> - `LLAMA_CURL` は非推奨で無視される（警告が出るだけ）ため除去
-> - SSH ダブルクォート内で `$(nproc)` を使う場合は `\$(nproc)` とエスケープすること（エスケープなしだとローカル側の値が展開される）
 > - `cmake --build build` の代わりに `make -C build -j$(nproc)` でも同等に動作する
-
-### rdma-server 起動 (2号機)
-
-```bash
-ssh 192.168.100.2 "LD_LIBRARY_PATH=/home/ubuntu/projects/llama.cpp/build/bin \
-  nohup /home/ubuntu/projects/llama.cpp/build/bin/rdma-server -H 0.0.0.0 -p 50051 > /tmp/rdma-server.log 2>&1 &"
-```
+> - ビルドログは `/tmp/cmake_configure.log` (configure) と `/tmp/build.log` (build) に出力される
 
 ### llama-bench 実行 (1号機)
 
@@ -184,6 +192,8 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
 | `GGML_RDMA_NO_STAGING` | `1` でホストステージングバッファを無効化 (Send/Recvフォールバック) | 未設定 |
 | `GGML_RDMA_PROFILE` | `1` でクライアント側プロファイリング有効化 | 未設定 |
 | `GGML_RDMA_DEBUG` | `1` でデバッグログ出力 | 未設定 |
+| `GGML_RDMA_TIMEOUT_MS` | RDMA 操作 (Send/Recv/Write/Read) のタイムアウト (ms) | 30000 |
+| `GGML_RDMA_COMPUTE_TIMEOUT_MS` | graph_compute 応答待ちのタイムアウト (ms) | 300000 |
 
 ### よくあるエラーと対処法
 

@@ -12,6 +12,16 @@
 
 static const char * RDMA_DEBUG = std::getenv("GGML_RDMA_DEBUG");
 
+static int get_rdma_timeout_ms() {
+    const char * env = std::getenv("GGML_RDMA_TIMEOUT_MS");
+    if (env) {
+        int val = std::atoi(env);
+        if (val > 0) return val;
+    }
+    return 30000;
+}
+static const int RDMA_TIMEOUT_MS = get_rdma_timeout_ms();
+
 #define RDMA_LOG_DBG(...) \
     do { if (RDMA_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
@@ -436,7 +446,7 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
         }
 
         // Wait for completion
-        if (!wait_for_completion(30000)) {
+        if (!wait_for_completion(RDMA_TIMEOUT_MS)) {
             GGML_LOG_ERROR("[rdma_connection] Send completion timeout\n");
             return false;
         }
@@ -451,9 +461,22 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
     return true;
 }
 
-bool rdma_connection::recv(void * data, size_t size, struct ibv_mr * mr) {
+bool rdma_connection::recv(void * data, size_t size, struct ibv_mr * mr, int timeout_ms) {
     if (!connected_ || !qp_) {
         return false;
+    }
+
+    // timeout_ms semantics:
+    //   -1 (default): use RDMA_TIMEOUT_MS (30s)
+    //    0: infinite wait (no timeout) — for server command loop idle wait
+    //   >0: use specified value
+    int effective_timeout;
+    if (timeout_ms == 0) {
+        effective_timeout = -1;  // negative = infinite in wait_for_completion
+    } else if (timeout_ms > 0) {
+        effective_timeout = timeout_ms;
+    } else {
+        effective_timeout = RDMA_TIMEOUT_MS;  // default (30s)
     }
 
     uint8_t * dst = static_cast<uint8_t *>(data);
@@ -487,7 +510,7 @@ bool rdma_connection::recv(void * data, size_t size, struct ibv_mr * mr) {
         }
 
         // Wait for completion
-        if (!wait_for_completion(30000)) {
+        if (!wait_for_completion(effective_timeout)) {
             GGML_LOG_ERROR("[rdma_connection] Receive completion timeout\n");
             return false;
         }
@@ -566,7 +589,7 @@ bool rdma_connection::rdma_write(const void * local_data, size_t size, struct ib
     }
 
     if (signaled) {
-        if (!wait_for_completion(30000)) {
+        if (!wait_for_completion(RDMA_TIMEOUT_MS)) {
             GGML_LOG_ERROR("[rdma_connection] RDMA write completion timeout: size=%zu, remote_addr=0x%lx, rkey=0x%x\n",
                            size, (unsigned long)remote.addr, remote.rkey);
             return false;
@@ -609,7 +632,7 @@ bool rdma_connection::rdma_read(void * local_data, size_t size, struct ibv_mr * 
     }
 
     if (signaled) {
-        if (!wait_for_completion(30000)) {
+        if (!wait_for_completion(RDMA_TIMEOUT_MS)) {
             GGML_LOG_ERROR("[rdma_connection] RDMA read completion timeout\n");
             return false;
         }
@@ -654,6 +677,7 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
     struct ibv_wc wc = {};
     auto start = std::chrono::steady_clock::now();
     int poll_count = 0;
+    int64_t last_progress_ms = 0;
 
     while (true) {
         int n = ibv_poll_cq(cq_, 1, &wc);
@@ -670,19 +694,27 @@ bool rdma_connection::wait_for_completion(int timeout_ms) {
             GGML_LOG_ERROR("[rdma_connection] Failed to poll CQ: %s\n", strerror(errno));
             return false;
         }
-        // Experiment 2: DISABLED - caused 2s delays
-        // First 100 polls are busy (for low-latency completions), then sleep 10us
-        // if (++poll_count > 100) {
-        //     usleep(10);
-        // }
         (void)poll_count;
-        if (timeout_ms >= 0) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (elapsed > timeout_ms) {
-                GGML_LOG_ERROR("[rdma_connection] Completion timeout after %d ms\n", timeout_ms);
-                return false;
-            }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        // For infinite-wait operations (e.g., server waiting for next client command),
+        // sleep after initial busy-poll period to avoid 100% CPU usage.
+        // Regular RDMA ops (timeout >= 0) always busy-poll for lowest latency.
+        if (timeout_ms < 0 && elapsed > 1000) {
+            usleep(1000);  // 1ms sleep — acceptable latency for idle command wait
+        }
+
+        // Progress log every 10 seconds for long waits (skip for infinite-wait idle loops)
+        if (timeout_ms >= 0 && elapsed > 10000 && elapsed - last_progress_ms >= 10000) {
+            GGML_LOG_WARN("[rdma_connection] Still waiting for completion: %lld ms elapsed (timeout=%d ms)\n",
+                          (long long)elapsed, timeout_ms);
+            last_progress_ms = elapsed;
+        }
+
+        if (timeout_ms >= 0 && elapsed > timeout_ms) {
+            GGML_LOG_ERROR("[rdma_connection] Completion timeout after %d ms\n", timeout_ms);
+            return false;
         }
     }
 }
@@ -853,7 +885,18 @@ std::shared_ptr<rdma_connection> rdma_connection_manager::accept_connection() {
             return nullptr;
         }
 
-        // Skip non-connect events (e.g. DISCONNECTED from previous client)
+        // Handle DISCONNECT from previous client: call rdma_disconnect() to transition
+        // QP to ERROR state, which flushes pending recv WRs and unblocks the command
+        // loop thread (prevents thread leak).
+        if (event->event == RDMA_CM_EVENT_DISCONNECTED) {
+            struct rdma_cm_id * disconnected_id = event->id;  // save before ack frees event
+            GGML_LOG_INFO("[rdma_connection_manager] Client disconnected (CM event), triggering QP error transition\n");
+            rdma_ack_cm_event(event);
+            rdma_disconnect(disconnected_id);
+            continue;
+        }
+
+        // Skip other non-connect events
         if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
             RDMA_LOG_DBG("[rdma_connection_manager] Skipping CM event: %s (%d)\n",
                          rdma_event_str(event->event), event->event);
@@ -895,7 +938,16 @@ std::shared_ptr<rdma_connection> rdma_connection_manager::accept_connection() {
                 (event->event == RDMA_CM_EVENT_REJECTED ||
                  event->event == RDMA_CM_EVENT_CONNECT_ERROR));
 
-            // Skip events for other connections (ESTABLISHED, DISCONNECTED, etc.)
+            // Handle DISCONNECT for other connections (trigger QP error transition)
+            if (event->event == RDMA_CM_EVENT_DISCONNECTED && event->id != client_id) {
+                struct rdma_cm_id * disconnected_id = event->id;
+                GGML_LOG_INFO("[rdma_connection_manager] Other client disconnected (CM event) during ESTABLISHED wait\n");
+                rdma_ack_cm_event(event);
+                rdma_disconnect(disconnected_id);
+                continue;
+            }
+
+            // Skip other events for other connections
             RDMA_LOG_DBG("[rdma_connection_manager] Skipping CM event while waiting for ESTABLISHED: %s (%d) for id %p (want %p)\n",
                          rdma_event_str(event->event), event->event, (void*)event->id, (void*)client_id);
             rdma_ack_cm_event(event);

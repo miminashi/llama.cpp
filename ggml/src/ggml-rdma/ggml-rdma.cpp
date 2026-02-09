@@ -29,6 +29,16 @@ using namespace ggml_rdma;
 static const char * RDMA_DEBUG = std::getenv("GGML_RDMA_DEBUG");
 static const char * RDMA_PROFILE = std::getenv("GGML_RDMA_PROFILE");
 
+static int get_rdma_compute_timeout_ms() {
+    const char * env = std::getenv("GGML_RDMA_COMPUTE_TIMEOUT_MS");
+    if (env) {
+        int val = std::atoi(env);
+        if (val > 0) return val;
+    }
+    return 300000; // 5 minutes default for compute operations
+}
+static const int RDMA_COMPUTE_TIMEOUT_MS = get_rdma_compute_timeout_ms();
+
 #define RDMA_LOG_DBG(...) \
     do { if (RDMA_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
@@ -656,7 +666,8 @@ static bool send_rdma_cmd_raw(rdma_connection * conn, rdma_cmd cmd, const void *
 // Thread-safe: protects the entire send+recv sequence with op_mutex_
 // Returns timing info via optional out parameters (in microseconds)
 static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * input, size_t input_size,
-                          struct ibv_mr * send_mr, uint64_t * out_send_us = nullptr, uint64_t * out_recv_us = nullptr) {
+                          struct ibv_mr * send_mr, uint64_t * out_send_us = nullptr,
+                          uint64_t * out_recv_us = nullptr, int recv_timeout_ms = -1) {
     std::lock_guard<std::recursive_mutex> op_lock(conn->op_mutex_);
     RDMA_LOG_DBG("[send_rdma_cmd] cmd=%d, input_size=%zu (locked)\n", (int)cmd, input_size);
 
@@ -670,7 +681,7 @@ static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * inp
     // We must receive it to keep the protocol synchronized.
     uint64_t t_recv = RDMA_PROFILE ? profile_now_us() : 0;
     uint64_t rsp_size = 0;
-    if (!conn->recv(&rsp_size, sizeof(rsp_size), nullptr)) {
+    if (!conn->recv(&rsp_size, sizeof(rsp_size), nullptr, recv_timeout_ms)) {
         return false;
     }
     uint64_t recv_us = RDMA_PROFILE ? profile_now_us() - t_recv : 0;
@@ -817,9 +828,13 @@ static rdma_tensor serialize_tensor(const ggml_tensor * tensor) {
 
 static void ggml_backend_rdma_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rdma_buffer_context * ctx = (ggml_backend_rdma_buffer_context *)buffer->context;
-    rdma_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FREE_BUFFER, &request, sizeof(request), nullptr);
-    RDMA_STATUS_ASSERT(status);
+    if (ctx->conn && ctx->conn->is_connected()) {
+        rdma_msg_free_buffer_req request = {ctx->remote_ptr};
+        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FREE_BUFFER, &request, sizeof(request), nullptr);
+        if (!status) {
+            GGML_LOG_WARN("[rdma] Failed to send FREE_BUFFER to server (connection may be closed)\n");
+        }
+    }
     delete ctx;
 }
 
@@ -1289,7 +1304,7 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
 }
 
 static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
+    uint64_t t0 = profile_now_us();
     ggml_backend_rdma_context * ctx = (ggml_backend_rdma_context *)backend->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
@@ -1322,7 +1337,8 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             uint64_t send_us = 0, recv_us = 0;
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE,
                                         input.data(), input.size(), nullptr,
-                                        RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr);
+                                        RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr,
+                                        RDMA_COMPUTE_TIMEOUT_MS);
             RDMA_STATUS_ASSERT(status);
             if (RDMA_PROFILE) {
                 g_profile.graph_compute_recompute++;
@@ -1364,7 +1380,8 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             uint64_t upd_send_us = 0, upd_recv_us = 0;
             bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE,
                                         input.data(), input.size(), nullptr,
-                                        RDMA_PROFILE ? &upd_send_us : nullptr, RDMA_PROFILE ? &upd_recv_us : nullptr);
+                                        RDMA_PROFILE ? &upd_send_us : nullptr, RDMA_PROFILE ? &upd_recv_us : nullptr,
+                                        RDMA_COMPUTE_TIMEOUT_MS);
             RDMA_STATUS_ASSERT(status);
             if (RDMA_PROFILE) {
                 g_profile.graph_compute_update++;
@@ -1406,7 +1423,8 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
 
         uint64_t send_us = 0, recv_us = 0;
         bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr,
-                                     RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr);
+                                     RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr,
+                                     RDMA_COMPUTE_TIMEOUT_MS);
         RDMA_STATUS_ASSERT(status);
 
         if (RDMA_PROFILE) {
@@ -1422,20 +1440,27 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         if (RDMA_PROFILE) g_profile.graph_compute_full++;
     }
 
-    if (RDMA_PROFILE) {
-        uint64_t elapsed = profile_now_us() - t0;
-        g_profile.graph_compute_calls++;
-        g_profile.graph_compute_us += elapsed;
-
-        uint64_t calls = g_profile.graph_compute_calls.load();
-        uint64_t interval = g_profile_print_interval.load();
-        if (interval > 0 && calls % interval == 0) {
-            g_profile.print_summary();
+    {
+        uint64_t compute_elapsed = profile_now_us() - t0;
+        if (compute_elapsed > 10000000) { // > 10s
+            GGML_LOG_WARN("[rdma] graph_compute took %.1f s (device=%u, n_nodes=%d)\n",
+                          compute_elapsed / 1000000.0, ctx->device, cgraph->n_nodes);
         }
-        // Print every call's timing during first 20 calls and then every 10th
-        if (calls <= 20 || (interval > 0 && calls % interval == 0)) {
-            fprintf(stderr, "[client profile] graph_compute #%lu: %.2f ms (reuse=%d, n_flush=%u, n_nodes=%d)\n",
-                    (unsigned long)calls, elapsed/1000.0, reuse ? 1 : 0, n_flush, cgraph->n_nodes);
+
+        if (RDMA_PROFILE) {
+            g_profile.graph_compute_calls++;
+            g_profile.graph_compute_us += compute_elapsed;
+
+            uint64_t calls = g_profile.graph_compute_calls.load();
+            uint64_t interval = g_profile_print_interval.load();
+            if (interval > 0 && calls % interval == 0) {
+                g_profile.print_summary();
+            }
+            // Print every call's timing during first 20 calls and then every 10th
+            if (calls <= 20 || (interval > 0 && calls % interval == 0)) {
+                fprintf(stderr, "[client profile] graph_compute #%lu: %.2f ms (reuse=%d, n_flush=%u, n_nodes=%d)\n",
+                        (unsigned long)calls, compute_elapsed/1000.0, reuse ? 1 : 0, n_flush, cgraph->n_nodes);
+            }
         }
     }
 
@@ -3010,7 +3035,7 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
         uint8_t header_buf[1 + sizeof(uint64_t)];
         while (true) {
             uint64_t t_cmd_start = RDMA_PROFILE ? profile_now_us() : 0;
-            if (!conn->recv(header_buf, cmd_header_size, nullptr)) {
+            if (!conn->recv(header_buf, cmd_header_size, nullptr, 0)) {  // 0 = no timeout (wait indefinitely for next command)
                 break;
             }
 
