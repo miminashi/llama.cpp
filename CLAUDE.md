@@ -194,6 +194,7 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
 | `GGML_RDMA_DEBUG` | `1` でデバッグログ出力 | 未設定 |
 | `GGML_RDMA_TIMEOUT_MS` | RDMA 操作 (Send/Recv/Write/Read) のタイムアウト (ms) | 30000 |
 | `GGML_RDMA_COMPUTE_TIMEOUT_MS` | graph_compute 応答待ちのタイムアウト (ms) | 300000 |
+| `GGML_RDMA_ASYNC_COMPUTE` | `0` で graph_compute の fire-and-forget を無効化 (デバッグ用) | 未設定 (有効) |
 
 ### よくあるエラーと対処法
 

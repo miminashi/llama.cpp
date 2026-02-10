@@ -145,6 +145,7 @@ public:
     // can call send_rdma_cmd while already holding the lock.
     std::recursive_mutex    op_mutex_;
     std::mutex              poll_mutex_;
+    std::atomic<bool>       compute_pending_{false};
 };
 
 // RDMA connection manager - manages multiple connections and server socket

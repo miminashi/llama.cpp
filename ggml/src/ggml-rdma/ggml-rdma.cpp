@@ -29,6 +29,13 @@ using namespace ggml_rdma;
 static const char * RDMA_DEBUG = std::getenv("GGML_RDMA_DEBUG");
 static const char * RDMA_PROFILE = std::getenv("GGML_RDMA_PROFILE");
 
+static bool get_rdma_async_compute() {
+    const char * env = std::getenv("GGML_RDMA_ASYNC_COMPUTE");
+    if (env && std::string(env) == "0") return false;
+    return true; // default enabled
+}
+static const bool RDMA_ASYNC_COMPUTE = get_rdma_async_compute();
+
 static int get_rdma_compute_timeout_ms() {
     const char * env = std::getenv("GGML_RDMA_COMPUTE_TIMEOUT_MS");
     if (env) {
@@ -198,6 +205,9 @@ enum rdma_cmd : uint8_t {
     RDMA_CMD_FLUSH_ALL_STAGING, // Flush all dirty staging buffers to GPU (batch flush before graph_compute)
     RDMA_CMD_FLUSH_AND_RECOMPUTE,      // Flush + graph_recompute in one round-trip
     RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE, // Flush + graph_compute_update in one round-trip
+    RDMA_CMD_FLUSH_AND_RECOMPUTE_ASYNC,      // Async: no response sent
+    RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE_ASYNC, // Async: no response sent
+    RDMA_CMD_GRAPH_COMPUTE_ASYNC,            // Async: no response sent
     RDMA_CMD_COUNT,
 };
 
@@ -692,9 +702,32 @@ static bool send_rdma_cmd(rdma_connection * conn, rdma_cmd cmd, const void * inp
         return false;
     }
 
+    // Any successful recv from server means all prior async commands have completed
+    conn->compute_pending_.store(false, std::memory_order_release);
+
     if (out_send_us) *out_send_us = send_us;
     if (out_recv_us) *out_recv_us = recv_us;
 
+    return true;
+}
+
+// Send command with no response expected (fire-and-forget).
+// Server will NOT send any response for ASYNC commands.
+// Thread-safe: acquires op_mutex_ for send only, then releases immediately.
+static bool send_rdma_cmd_async(rdma_connection * conn, rdma_cmd cmd, const void * input, size_t input_size,
+                                uint64_t * out_send_us = nullptr) {
+    std::lock_guard<std::recursive_mutex> op_lock(conn->op_mutex_);
+    RDMA_LOG_DBG("[send_rdma_cmd_async] cmd=%d, input_size=%zu (locked)\n", (int)cmd, input_size);
+
+    uint64_t t_send = RDMA_PROFILE ? profile_now_us() : 0;
+    if (!send_rdma_cmd_raw(conn, cmd, input, input_size, nullptr)) {
+        return false;
+    }
+    uint64_t send_us = RDMA_PROFILE ? profile_now_us() - t_send : 0;
+
+    conn->compute_pending_.store(true, std::memory_order_release);
+
+    if (out_send_us) *out_send_us = send_us;
     return true;
 }
 
@@ -752,7 +785,11 @@ static bool send_rdma_cmd_with_rsp(rdma_connection * conn, rdma_cmd cmd,
     if (!send_rdma_cmd_raw(conn, cmd, input, input_size, nullptr)) {
         return false;
     }
-    return recv_rdma_rsp(conn, output, output_size, nullptr);
+    bool ok = recv_rdma_rsp(conn, output, output_size, nullptr);
+    if (ok) {
+        conn->compute_pending_.store(false, std::memory_order_release);
+    }
+    return ok;
 }
 
 // Version check
@@ -986,7 +1023,12 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     // Only use RDMA Read for GDR MRs (reading directly from GPU VRAM).
     // Staging MRs contain stale data from set_tensor, NOT the latest GPU compute results,
     // so RDMA Read would return wrong data. Fall through to Send/Recv instead.
-    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr && ctx->mr_is_gdr) {
+    // When compute_pending is set (async graph_compute in flight), skip RDMA Read
+    // because it bypasses the server command queue and may read pre-compute data.
+    // The Send/Recv path goes through the server command queue, which implicitly
+    // waits for the pending compute to finish before returning tensor data.
+    if (ctx->mr_rkey != 0 && ctx->staging && ctx->base_ptr != nullptr && ctx->mr_is_gdr
+        && !ctx->conn->compute_pending_.load(std::memory_order_acquire)) {
         struct ibv_mr * mr = nullptr;
         void * buf = ctx->staging->get_buffer(size, &mr);
         if (buf) {
@@ -1013,7 +1055,10 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         }
     }
 
-    // Fall back to recv-based transfer
+    // Fall back to recv-based transfer.
+    // This path goes through the server command queue, so if an async compute is
+    // pending, the server will finish it before processing this GET_TENSOR command.
+    // This provides implicit synchronization for fire-and-forget graph_compute.
     rdma_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
@@ -1021,6 +1066,10 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     bool status = send_rdma_cmd_with_rsp(ctx->conn.get(), RDMA_CMD_GET_TENSOR,
                                           &request, sizeof(request), data, size);
     RDMA_STATUS_ASSERT(status);
+
+    // Clear compute_pending after successful recv — the server has completed
+    // the pending compute and returned the result through the command queue.
+    ctx->conn->compute_pending_.store(false, std::memory_order_release);
 
     if (RDMA_PROFILE) {
         uint64_t elapsed = profile_now_us() - t0;
@@ -1321,7 +1370,7 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         ctx->gc.collect_updates(cgraph, updates, visited);
 
         if (updates.empty()) {
-            // Pure recompute — combine flush + recompute in one round-trip
+            // Pure recompute — combine flush + recompute
             // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) |
             size_t input_size = sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry) + sizeof(uint32_t);
             std::vector<uint8_t> input(input_size);
@@ -1335,27 +1384,32 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             memcpy(dest, &ctx->device, sizeof(ctx->device));
 
             uint64_t send_us = 0, recv_us = 0;
-            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE,
-                                        input.data(), input.size(), nullptr,
-                                        RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr,
-                                        RDMA_COMPUTE_TIMEOUT_MS);
-            RDMA_STATUS_ASSERT(status);
+            if (RDMA_ASYNC_COMPUTE) {
+                bool status = send_rdma_cmd_async(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE_ASYNC,
+                                                  input.data(), input.size(), RDMA_PROFILE ? &send_us : nullptr);
+                RDMA_STATUS_ASSERT(status);
+            } else {
+                bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_RECOMPUTE,
+                                            input.data(), input.size(), nullptr,
+                                            RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr,
+                                            RDMA_COMPUTE_TIMEOUT_MS);
+                RDMA_STATUS_ASSERT(status);
+            }
             if (RDMA_PROFILE) {
                 g_profile.graph_compute_recompute++;
                 uint64_t calls = g_profile.graph_compute_calls.load() + 1;
                 uint64_t total_cmd = send_us + recv_us;
-                // Check for spike (> 500ms)
                 if (total_cmd > 500000) {
                     fprintf(stderr, "[client SPIKE] recompute #%lu: send=%.2f ms, recv=%.2f ms (TOTAL=%.2f ms)\n",
                             (unsigned long)calls, send_us/1000.0, recv_us/1000.0, total_cmd/1000.0);
                 } else if (calls <= 20 || calls % g_profile_print_interval.load() == 0) {
                     uint64_t pre_send = profile_now_us() - t0 - send_us - recv_us;
-                    fprintf(stderr, "[client detail] recompute: pre_send=%.2f ms, send=%.2f ms, recv=%.2f ms\n",
-                            pre_send/1000.0, send_us/1000.0, recv_us/1000.0);
+                    fprintf(stderr, "[client detail] recompute%s: pre_send=%.2f ms, send=%.2f ms, recv=%.2f ms\n",
+                            RDMA_ASYNC_COMPUTE ? " (async)" : "", pre_send/1000.0, send_us/1000.0, recv_us/1000.0);
                 }
             }
         } else {
-            // Delta updates — combine flush + compute_update in one round-trip
+            // Delta updates — combine flush + compute_update
             // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) | n_updates(4B) | updates(M*100B) |
             uint32_t n_updates = updates.size();
             size_t input_size = sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry)
@@ -1378,16 +1432,21 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
                          n_flush, n_updates, input_size);
 
             uint64_t upd_send_us = 0, upd_recv_us = 0;
-            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE,
-                                        input.data(), input.size(), nullptr,
-                                        RDMA_PROFILE ? &upd_send_us : nullptr, RDMA_PROFILE ? &upd_recv_us : nullptr,
-                                        RDMA_COMPUTE_TIMEOUT_MS);
-            RDMA_STATUS_ASSERT(status);
+            if (RDMA_ASYNC_COMPUTE) {
+                bool status = send_rdma_cmd_async(ctx->conn.get(), RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE_ASYNC,
+                                                  input.data(), input.size(), RDMA_PROFILE ? &upd_send_us : nullptr);
+                RDMA_STATUS_ASSERT(status);
+            } else {
+                bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE,
+                                            input.data(), input.size(), nullptr,
+                                            RDMA_PROFILE ? &upd_send_us : nullptr, RDMA_PROFILE ? &upd_recv_us : nullptr,
+                                            RDMA_COMPUTE_TIMEOUT_MS);
+                RDMA_STATUS_ASSERT(status);
+            }
             if (RDMA_PROFILE) {
                 g_profile.graph_compute_update++;
                 uint64_t total_cmd = upd_send_us + upd_recv_us;
                 uint64_t calls = g_profile.graph_compute_calls.load() + 1;
-                // Check for spike (> 500ms)
                 if (total_cmd > 500000) {
                     fprintf(stderr, "[client SPIKE] update #%lu: send=%.2f ms, recv=%.2f ms (TOTAL=%.2f ms)\n",
                             (unsigned long)calls, upd_send_us/1000.0, upd_recv_us/1000.0, total_cmd/1000.0);
@@ -1422,16 +1481,22 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         uint64_t serialize_us = RDMA_PROFILE ? profile_now_us() - t_serialize : 0;
 
         uint64_t send_us = 0, recv_us = 0;
-        bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr,
-                                     RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr,
-                                     RDMA_COMPUTE_TIMEOUT_MS);
-        RDMA_STATUS_ASSERT(status);
+        if (RDMA_ASYNC_COMPUTE) {
+            bool status = send_rdma_cmd_async(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE_ASYNC,
+                                              input.data(), input.size(), RDMA_PROFILE ? &send_us : nullptr);
+            RDMA_STATUS_ASSERT(status);
+        } else {
+            bool status = send_rdma_cmd(ctx->conn.get(), RDMA_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr,
+                                         RDMA_PROFILE ? &send_us : nullptr, RDMA_PROFILE ? &recv_us : nullptr,
+                                         RDMA_COMPUTE_TIMEOUT_MS);
+            RDMA_STATUS_ASSERT(status);
+        }
 
         if (RDMA_PROFILE) {
             uint64_t calls = g_profile.graph_compute_calls.load() + 1;
-            // Always print full graph send details (they are rare and important)
-            fprintf(stderr, "[client FULL_GRAPH] #%lu: serialize=%.2f ms (size=%zu), send=%.2f ms, recv=%.2f ms, n_nodes=%d\n",
-                    (unsigned long)calls, serialize_us/1000.0, input.size(), send_us/1000.0, recv_us/1000.0, cgraph->n_nodes);
+            fprintf(stderr, "[client FULL_GRAPH%s] #%lu: serialize=%.2f ms (size=%zu), send=%.2f ms, recv=%.2f ms, n_nodes=%d\n",
+                    RDMA_ASYNC_COMPUTE ? " async" : "", (unsigned long)calls, serialize_us/1000.0, input.size(),
+                    send_us/1000.0, recv_us/1000.0, cgraph->n_nodes);
         }
 
         // Save snapshots for future diffs
@@ -3265,6 +3330,39 @@ void ggml_backend_rdma_start_server(const char * endpoint, const char * cache_di
                         uint64_t total = profile_now_us() - t_cmd_start;
                         fprintf(stderr, "[server profile] cmd FLUSH_AND_COMPUTE_UPDATE: total=%.2f ms (recv=%.2f, rsp_send=%.2f)\n",
                                 total/1000.0, recv_us/1000.0, rsp_us/1000.0);
+                    }
+                    break;
+                }
+                case RDMA_CMD_FLUSH_AND_RECOMPUTE_ASYNC: {
+                    if (!server->flush_and_recompute(msg_data)) {
+                        fprintf(stderr, "flush_and_recompute (async) failed\n");
+                    }
+                    if (RDMA_PROFILE) {
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd FLUSH_AND_RECOMPUTE_ASYNC: total=%.2f ms (recv=%.2f)\n",
+                                total/1000.0, recv_us/1000.0);
+                    }
+                    break;
+                }
+                case RDMA_CMD_FLUSH_AND_COMPUTE_UPDATE_ASYNC: {
+                    if (!server->flush_and_compute_update(msg_data)) {
+                        fprintf(stderr, "flush_and_compute_update (async) failed\n");
+                    }
+                    if (RDMA_PROFILE) {
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd FLUSH_AND_COMPUTE_UPDATE_ASYNC: total=%.2f ms (recv=%.2f)\n",
+                                total/1000.0, recv_us/1000.0);
+                    }
+                    break;
+                }
+                case RDMA_CMD_GRAPH_COMPUTE_ASYNC: {
+                    if (!server->graph_compute(msg_data)) {
+                        fprintf(stderr, "graph_compute (async) failed\n");
+                    }
+                    if (RDMA_PROFILE) {
+                        uint64_t total = profile_now_us() - t_cmd_start;
+                        fprintf(stderr, "[server profile] cmd GRAPH_COMPUTE_ASYNC: total=%.2f ms (recv=%.2f)\n",
+                                total/1000.0, recv_us/1000.0);
                     }
                     break;
                 }

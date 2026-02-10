@@ -190,8 +190,8 @@ bool rdma_connection::accept(struct rdma_cm_id * cm_id, const rdma_config & conf
 
     // Accept connection
     struct rdma_conn_param conn_param = {};
-    conn_param.initiator_depth = 1;
-    conn_param.responder_resources = 1;
+    conn_param.initiator_depth = 16;
+    conn_param.responder_resources = 16;
     conn_param.rnr_retry_count = config.rnr_retry;
 
     if (rdma_accept(cm_id_, &conn_param) != 0) {
@@ -324,8 +324,8 @@ bool rdma_connection::setup_qp(const rdma_config & config) {
 
 bool rdma_connection::connect_qp() {
     struct rdma_conn_param conn_param = {};
-    conn_param.initiator_depth = 1;
-    conn_param.responder_resources = 1;
+    conn_param.initiator_depth = 16;
+    conn_param.responder_resources = 16;
     conn_param.retry_count = config_.retry_count;
     conn_param.rnr_retry_count = config_.rnr_retry;
 
