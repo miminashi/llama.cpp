@@ -12,7 +12,8 @@
 - **Bashコマンドに `#` コメント行を含めない**: コメント付きコマンドはパーミッション自動承認が効かないため、コメントは Bash ツールの description パラメータに記載すること
 - **マルチラインコマンドを避ける**: 改行区切りの複数コマンドはパーミッション自動承認が効かない場合がある。`&&` や `;` で1行にまとめるか、複数の Bash 呼び出しに分割すること
 - **SSH コマンドを直接使わない**: `ssh`, `rsync`, `scp` はパーミッション自動承認が効かない (Claude Code の既知の制限)。代わりに `scripts/rdma-*.sh` ラッパースクリプトを `bash scripts/rdma-*.sh` で呼び出すこと
-- **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時に `report/` ディレクトリにレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う
+- **ワークツリー**: 修正作業を行う際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する
+- **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/report/` に作成する
 
 ## プロジェクト目標と現在の状況
 

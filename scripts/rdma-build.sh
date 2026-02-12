@@ -2,8 +2,9 @@
 set -euo pipefail
 
 NODE2="192.168.100.2"
-PROJECT_DIR="/home/ubuntu/projects/llama.cpp"
-WORKTREE_DIR="${PROJECT_DIR}/.worktree/rdma-backend"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKTREE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REMOTE_DIR="/home/ubuntu/projects/llama.cpp"
 CMAKE_OPTS="-DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=60"
 
 usage() {
@@ -25,7 +26,7 @@ build_local() {
 
 build_remote() {
     echo "=== Building on node 2 ($NODE2) ==="
-    ssh "$NODE2" "cd ${PROJECT_DIR} && rm -rf build && cmake -B build $CMAKE_OPTS > /tmp/cmake_configure.log 2>&1 && echo 'CMAKE CONFIGURE OK' || { echo 'CMAKE CONFIGURE FAILED'; exit 1; } && cmake --build build -- -j \$(nproc) > /tmp/build.log 2>&1 && echo 'BUILD OK' || { echo 'BUILD FAILED'; exit 1; }"
+    ssh "$NODE2" "cd ${REMOTE_DIR} && rm -rf build && cmake -B build $CMAKE_OPTS > /tmp/cmake_configure.log 2>&1 && echo 'CMAKE CONFIGURE OK' || { echo 'CMAKE CONFIGURE FAILED'; exit 1; } && cmake --build build -- -j \$(nproc) > /tmp/build.log 2>&1 && echo 'BUILD OK' || { echo 'BUILD FAILED'; exit 1; }"
     echo "=== Node 2 build complete ==="
 }
 
