@@ -47,21 +47,27 @@ v3 (02/09 03:09) 以降の約4日間で **17 本のレポート** (#50〜#66) �
 |---|-------------|---------|------------|--------|-----------|
 | 1 | Async compute (fire-and-forget) | [#51](2026-02-10_214841_rdma_async_compute_optimization.md) | `rdma-backend` | なし (e2e) | - |
 | 2 | initiator_depth 16 | [#51](2026-02-10_214841_rdma_async_compute_optimization.md) | `rdma-backend` | なし | - |
-| 3 | Doorbell batching + max_inline | [#52](2026-02-10_222348_doorbell_batching_max_inline.md) | `opt-doorbell-batch` | なし | **未マージ** |
+| 3 | Doorbell batching + max_inline | [#52](2026-02-10_222348_doorbell_batching_max_inline.md) | `opt-doorbell-batch` | なし | 未マージ |
 | 4 | Pre-posted recv | [#53](2026-02-11_040659_prepost_recv_rnr_nak.md) | `opt-prepost-recv` | なし | 未マージ |
 | 5 | Combined send | [#54](2026-02-11_045619_combined_send_rnr_nak.md) | `opt-combined-send` | 低下 | 未マージ |
 | 6 | Hotpath memory 最適化 | [#55](2026-02-11_095500_hotpath_memory_optimization.md) | `rdma-hotpath` | なし | 未マージ |
 | 7 | Cross-device cache | [#56](2026-02-11_133000_xdev_cache_optimization.md) | `rdma-xdev-cache` | なし | 未マージ |
-| 8 | Parallel compute dispatch | [#57](2026-02-11_214242_parallel_compute_dispatch.md) | `rdma-parallel-compute` | なし (e2e) | **未マージ** |
+| 8 | Parallel compute dispatch | [#57](2026-02-11_214242_parallel_compute_dispatch.md) | `rdma-parallel-compute` | なし (e2e) | 未マージ |
 | 9 | Hybrid parallelism research | [#58](2026-02-12_070600_hybrid_parallelism_research.md) | `hybrid-split-research` | (調査) | - |
 | 10 | Ngram speculative decoding | [#59](2026-02-12_134623_ngram_speculative_decoding_test.md) | `ngram-spec-test` | −7.8% | 未マージ |
 | 11 | Draft model speculative decoding | [#60](2026-02-12_160000_draft_speculative_decoding_test.md) | `draft-spec-test` | +3.9% (qwen) | 未マージ |
 | 12 | Comprehensive review | [#61](2026-02-13_044038_rdma_backend_comprehensive_review.md) | `rdma-backend` | (調査) | - |
-| 13 | Deferred copy | [#62](2026-02-13_053056_deferred_copy_optimization.md) | `rdma-deferred-copy` | **+13%** (20b) / **+5.9%** (GLM) | 機能コード反映済み (`1d2c9cbdd`)、開発スクリプト未反映 |
+| 13 | Deferred copy | [#62](2026-02-13_053056_deferred_copy_optimization.md) | `rdma-deferred-copy` | **+13%** (20b) / **+5.9%** (GLM) | 機能コードマージ済み (`1d2c9cbdd`)、開発スクリプト未マージ |
 | 14 | synchronize 実装 | [#63](2026-02-13_053658_rdma_synchronize_implementation.md) | `rdma-synchronize` | 未テスト | 未マージ |
 | 15 | Deferred copy 統計検証 | [#64](2026-02-13_090026_deferred_copy_statistical_benchmark.md) | `rdma-deferred-copy` | (検証) | (#13 と同一ワークツリー) |
 | 16 | 二峰性 tg 調査 | [#65](2026-02-13_153100_bimodal_tg_investigation.md) | `bimodal-investigation` | (調査) | - |
 | 17 | 二峰性 tg 修正 (fprintf) | [#65](2026-02-13_153100_bimodal_tg_investigation.md) | `fix-bimodal-fprintf` | **+10%** (安定化) | マージ済み (`5b6e0bf56`) |
+
+- **マージ状況の凡例**:
+  - `-`: rdma-backend で直接作業、またはコード変更なし (マージ対象なし)
+  - `マージ済み`: ワークツリーのコード変更が rdma-backend に取り込まれている
+  - `未マージ`: ワークツリーにコード変更があるが rdma-backend には未取り込み
+  - レポートは全て rdma-backend に作成されるため、マージ状況には含めない
 
 ---
 
@@ -245,7 +251,7 @@ v3 の 14 件 + 新規 2 件 = 合計 **16 件**。すべて修正済みまた�
 | `opt-prepost-recv` | `opt-prepost-recv` | Pre-posted recv | 実験コード、本採用見送り |
 | `opt-uncommitted` | `opt-uncommitted` | 最適化実験インフラ | 実験インフラ、本採用見送り |
 | `rdma-hotpath` | `feature/rdma-hotpath` | ホットパスメモリ最適化 | 実験コード、本採用見送り |
-| `rdma-deferred-copy` | `feature/rdma-deferred-copy` | Deferred copy 実装 | 機能コード反映済み (`1d2c9cbdd`)、開発スクリプト未反映 |
+| `rdma-deferred-copy` | `feature/rdma-deferred-copy` | Deferred copy 実装 | 機能コードマージ済み (`1d2c9cbdd`)、開発スクリプト未マージ |
 | `rdma-synchronize` | `feature/rdma-synchronize` | synchronize 実装 | 開発コード、未テスト |
 | `rdma-xdev-cache` | `feature/rdma-xdev-cache` | Cross-device cache | 実験コード、本採用見送り |
 | `rdma-parallel-compute` | `feature/rdma-parallel-compute` | Parallel compute dispatch | e2e 改善なし (クライアント sched 逐次制約) |
