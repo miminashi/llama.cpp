@@ -70,7 +70,7 @@ GLM-4.7 (160×21B MoE, 93レイヤー) を P100 PCIe 16GPU (2ノード×8) で�
 
 - **ハードウェア**: P100 PCIe 16GB × 16台 (2ノード × 8GPU)、100GbE RDMA (ConnectX-4)
 - **現在の実績**: GLM-4.7 IQ2_M on 11GPU (7C+4R): pp=6.4 t/s, tg=6.8 t/s
-- **制約**: P2P 無効、NVLink なし、ConnectX-4 MTT キャッシュ ~12GB
+- **制約**: NVLink なし (PCIe P2P は利用可能、NCCL_P2P_DISABLE=1)、ConnectX-4 MTT キャッシュ ~12GB
 
 ---
 
@@ -231,19 +231,23 @@ AllReduce データ量 (per layer):
 |---------|:-----------:|:-----:|
 | NVLink (P100) | 存在しない | — |
 | PCIe 3.0 (GPU↔CPU) | ~2-5 μs | 15.75 GB/s |
-| CPU メモリ (GPU0↔GPU1 via host) | ~10-50 μs | 12-15 GB/s |
+| PCIe P2P (GPU↔GPU, PIX) | ~2-10 μs | 10-11 GB/s |
+| PCIe P2P (GPU↔GPU, PHB) | ~5-20 μs | 8-10 GB/s |
 | RDMA (ノード間) | ~2-5 μs (RDMA Write) | 12.5 GB/s (100GbE) |
 
-**P100 PCIe に NVLink がない**ため、同一ノード内の GPU-GPU 通信もホストメモリ経由。
-AllReduce 1 回あたり 50-300μs (往復) とすると:
+**P100 PCIe に NVLink はない**が、PCIe P2P (BAR1マッピング) による GPU-GPU 直接転送が可能
+(1号機: 全7GPU間OK、2号機: GPU0-1-2間OK、GPU3はクロスソケットで不可)。
+ただし llama.cpp の row split は `NCCL_P2P_DISABLE=1` 環境では NCCL の P2P を使用しない。
+独自の memcpy ベース通信であり、`cudaMemcpyPeer` 経由で PCIe P2P が使われる。
+AllReduce 1 回あたり 20-100μs (PCIe P2P、往復) とすると:
 
 ```
-AllReduce cost (g GPU, PCIe host-staging):
-  - Ring AllReduce: 2 × (g-1)/g × 20KB, latency = 2 × (g-1) × 50μs
-  - g=2: ~100μs, g=4: ~300μs, g=8: ~700μs, g=16: ~1500μs
+AllReduce cost (g GPU, PCIe P2P):
+  - Ring AllReduce: 2 × (g-1)/g × 20KB, latency = 2 × (g-1) × 10-20μs (PIX/PHB)
+  - g=2: ~20-40μs, g=4: ~60-120μs, g=8: ~140-280μs, g=16: ~300-600μs
 
 Per-layer overhead with 2 AllReduce ops:
-  - g=2: ~200μs, g=4: ~600μs, g=8: ~1400μs, g=16: ~3000μs
+  - g=2: ~40-80μs, g=4: ~120-240μs, g=8: ~280-560μs, g=16: ~600-1200μs
 ```
 
 ### 3.3 llama.cpp の Row Split 実装
@@ -252,7 +256,7 @@ Per-layer overhead with 2 AllReduce ops:
 - 各 GPU にテンソルの行方向スライスを配置
 - **NCCL は不使用** — 独自の memcpy ベースの通信
 - ローカル GPU 間のみ対応 (リモート GPU 非対応)
-- 同一ノードでも P2P disabled の場合、ホストメモリ経由のステージングが必要
+- PCIe P2P は P100 で利用可能 (PIX/PHB トポロジ)。2号機 GPU3 のみクロスソケット (SYS) で P2P 不可
 
 ### 3.4 Row Split 性能予測
 
@@ -261,17 +265,17 @@ Per-layer overhead with 2 AllReduce ops:
   - Attention: ~0.8ms / g (行列乗算はリニアにスケール)
   - FFN (MoE): ~0.4ms / g (アクティブ Expert のみ)
 
-AllReduce 時間 (per layer, 2 ops):
-  - g=2: ~0.2ms, g=4: ~0.6ms, g=8: ~1.4ms
+AllReduce 時間 (per layer, 2 ops, PCIe P2P):
+  - g=2: ~0.06ms, g=4: ~0.18ms, g=8: ~0.42ms
 
 合計 (per layer):
   - g=1:  1.2ms (baseline)
-  - g=2:  0.8ms (計算0.6ms + AllReduce 0.2ms)
-  - g=4:  0.9ms (計算0.3ms + AllReduce 0.6ms)
-  - g=8:  1.55ms (計算0.15ms + AllReduce 1.4ms) ← 悪化
+  - g=2:  0.66ms (計算0.6ms + AllReduce 0.06ms)
+  - g=4:  0.48ms (計算0.3ms + AllReduce 0.18ms)
+  - g=8:  0.57ms (計算0.15ms + AllReduce 0.42ms) ← g=4 より悪化
 ```
 
-**結論**: NVLink なしの P100 PCIe では、g=2 程度が最適。g≥4 で AllReduce レイテンシが計算時間を上回る。
+**結論**: PCIe P2P が利用可能な P100 PCIe では、g=4 が最適 (0.48ms/layer)。g=2 も良好 (0.66ms)。g≥8 では AllReduce レイテンシ増加で悪化するが、NVLink なしでも g=4 まではスケールする。
 
 ---
 
@@ -384,8 +388,8 @@ Per-layer time (8 GPU EP):
 - PR #19378 は MoE モデルを**明示的に未サポート** — Dense attention 部分のみ
   - GLM-4.7 では Attention は TP 可能だが、MoE FFN は EP が必要
   - Shared FFN は TP 可能
-- P2P disabled 環境で `cudaMemcpyPeer` がホスト経由になる → 追加レイテンシ
-- `NCCL_P2P_DISABLE=1` が必須な現環境では、AllReduce の実効レイテンシが不確定
+- PCIe P2P (BAR1) が利用可能なため `cudaMemcpyPeer` は GPU 直接転送。ただし NVLink 比で帯域は劣る (~10 GB/s vs ~35 GB/s)
+- `NCCL_P2P_DISABLE=1` は NCCL の P2P を無効化するが、CUDA ネイティブの `cudaMemcpyPeer` は PCIe P2P を使用可能
 
 **実装複雑度**: 中-高
 **実装期間**: 2-4 週
@@ -717,5 +721,5 @@ Week 3+: EP または TP=2 の検討 (上記の結果を踏まえて判断)
 | NIC | ConnectX-4 100GbE (RDMA, GPUDirect 対応) |
 | PCIe | 3.0 x16 (15.75 GB/s per direction) |
 | NVLink | なし (P100 PCIe 版) |
-| P2P | 無効 (`NCCL_P2P_DISABLE=1`) |
+| P2P | PCIe P2P 利用可能 (NCCL P2P は `NCCL_P2P_DISABLE=1` で無効) |
 | MaxPayload | P100: 256B (hard limit), ConnectX-4: 256B |
