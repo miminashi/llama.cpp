@@ -2385,12 +2385,8 @@ public:
             GGML_LOG_ERROR("[rdma_server] error deserializing tensor in get_tensor\n");
             return false;
         }
-        {
-            auto dit = buffer_device_map_.find(tensor->buffer);
-            uint32_t dev = dit != buffer_device_map_.end() ? dit->second : 9999;
-            fprintf(stderr, "[rdma_server] get_tensor: buffer=%p (dev=%u), data=%p, offset=%" PRIu64 ", size=%" PRIu64 "\n",
-                     (void*)tensor->buffer, dev, tensor->data, request.offset, request.size);
-        }
+        RDMA_LOG_DBG("[rdma_server] get_tensor: buffer=%p, data=%p, offset=%" PRIu64 ", size=%" PRIu64 "\n",
+                     (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
         // Validate data region using server-side resolved address (not client's mmap address)
         const size_t p0 = (size_t)ggml_backend_buffer_get_base(tensor->buffer);
@@ -2404,18 +2400,6 @@ public:
 
         response.resize(request.size, 0);
         ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
-        {
-            uint32_t nonzero = 0;
-            for (size_t j = 0; j < response.size() && j < 1024; j++) {
-                if (response[j] != 0) nonzero++;
-            }
-            fprintf(stderr, "[rdma_server] get_tensor response: %zu B, first 1024B: %u nonzero (first 8: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
-                    response.size(), nonzero,
-                    response.size() >= 8 ? response[0] : 0, response.size() >= 8 ? response[1] : 0,
-                    response.size() >= 8 ? response[2] : 0, response.size() >= 8 ? response[3] : 0,
-                    response.size() >= 8 ? response[4] : 0, response.size() >= 8 ? response[5] : 0,
-                    response.size() >= 8 ? response[6] : 0, response.size() >= 8 ? response[7] : 0);
-        }
         return true;
     }
 
@@ -3146,7 +3130,7 @@ private:
     void fix_cross_device_refs(ggml_cgraph * graph, uint32_t device, stored_graph & sg,
                                const std::unordered_map<void *, void *> & dc_lookup = {}) {
         if (!dc_lookup.empty()) {
-            fprintf(stderr, "[fix_xdev] device=%u, dc_lookup has %zu entries\n", device, dc_lookup.size());
+            RDMA_LOG_DBG("[fix_xdev] device=%u, dc_lookup has %zu entries\n", device, dc_lookup.size());
         }
         // Free previous cross-device allocations
         if (!sg.cross_device_allocs.empty()) {
@@ -3172,14 +3156,14 @@ private:
             // Check if data was already copied by deferred copy (server-side cudaMemcpyPeer)
             auto dc = dc_lookup.find(t->data);
             if (dc != dc_lookup.end()) {
-                fprintf(stderr, "[fix_xdev] DC HIT: %s data=%p -> %p (dev %u -> %u, %zu B)\n",
+                RDMA_LOG_DBG("[fix_xdev] DC HIT: %s data=%p -> %p (dev %u -> %u, %zu B)\n",
                         t->name, t->data, dc->second, bit->second, device, ggml_nbytes(t));
                 copied_ptrs[t->data] = dc->second;
                 t->data = dc->second;
                 return;
             }
 
-            fprintf(stderr, "[fix_xdev] DC MISS (fallback D2H+H2D): %s data=%p buf=%p (dev %u -> %u, %zu B)\n",
+            RDMA_LOG_DBG("[fix_xdev] DC MISS (fallback D2H+H2D): %s data=%p buf=%p (dev %u -> %u, %zu B)\n",
                     t->name, t->data, (void*)t->buffer, bit->second, device, ggml_nbytes(t));
 
             size_t nbytes = ggml_nbytes(t);
