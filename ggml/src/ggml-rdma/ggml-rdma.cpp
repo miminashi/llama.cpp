@@ -411,6 +411,50 @@ static std::shared_ptr<pending_flush_list> get_pending_flushes(rdma_connection *
     return pf;
 }
 
+// Deferred copy: records cross-device copies within the same RDMA connection.
+// Instead of get_tensor+set_tensor round-trips through the client, the server
+// executes cudaMemcpyPeer directly. Entries are drained into ASYNC messages.
+struct deferred_copy_entry {
+    uint64_t src_buffer;   // Server-side source buffer pointer (remote_ptr)
+    uint64_t src_offset;   // Offset within source buffer
+    uint64_t dst_buffer;   // Server-side destination buffer pointer (remote_ptr)
+    uint64_t dst_offset;   // Offset within destination buffer
+    uint64_t size;         // Copy size in bytes
+    uint32_t padding[2];   // Align to 48 bytes
+};
+static_assert(sizeof(deferred_copy_entry) == 48, "deferred_copy_entry must be 48 bytes");
+
+struct deferred_copy_list {
+    std::vector<deferred_copy_entry> entries;
+    std::mutex mutex;
+
+    void add(uint64_t src_buf, uint64_t src_off, uint64_t dst_buf, uint64_t dst_off, uint64_t sz) {
+        std::lock_guard<std::mutex> lock(mutex);
+        entries.push_back({src_buf, src_off, dst_buf, dst_off, sz, {0, 0}});
+    }
+
+    std::vector<deferred_copy_entry> drain() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<deferred_copy_entry> result;
+        result.swap(entries);
+        return result;
+    }
+};
+
+static std::unordered_map<rdma_connection *, std::shared_ptr<deferred_copy_list>> g_conn_deferred_copies;
+static std::mutex g_conn_deferred_copies_mutex;
+
+static std::shared_ptr<deferred_copy_list> get_deferred_copies(rdma_connection * conn) {
+    std::lock_guard<std::mutex> lock(g_conn_deferred_copies_mutex);
+    auto it = g_conn_deferred_copies.find(conn);
+    if (it != g_conn_deferred_copies.end()) {
+        return it->second;
+    }
+    auto dc = std::make_shared<deferred_copy_list>();
+    g_conn_deferred_copies[conn] = dc;
+    return dc;
+}
+
 #pragma pack(pop)
 
 // RDMA data structures
@@ -1081,18 +1125,59 @@ static void ggml_backend_rdma_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 }
 
 static bool ggml_backend_rdma_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
-    // Disable server-side copy_tensor and always use get_tensor+set_tensor fallback.
-    // Server-side copy_tensor (GPU-to-GPU via cudaMemcpyPeer) produces correct data at the
-    // destination buffer, but the graph cache's tensor pointers reference different memory
-    // than the copy destination, causing graph_recompute to read stale data.
-    // The get_tensor+set_tensor fallback goes through the normal set_tensor path which
-    // correctly updates the data that graph_recompute references.
-    // Performance impact is minimal (~3% generation speed) since only inter-layer boundary
-    // tensors (norm, l_out) are copied between devices.
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
-    return false;
+    // Deferred copy: record cross-device copy for same-connection RDMA buffers.
+    static const bool DEFERRED_COPY_DISABLED = !!std::getenv("GGML_RDMA_NO_DEFERRED_COPY");
+    if (DEFERRED_COPY_DISABLED) return false;
+
+    auto * dst_ctx = (ggml_backend_rdma_buffer_context *)buffer->context;
+
+    if (!src->buffer || !src->buffer->context) {
+        if (RDMA_DEBUG) fprintf(stderr, "[rdma cpy_tensor] SKIP: src buffer null\n");
+        return false;
+    }
+
+    if (src->buffer->iface.cpy_tensor != ggml_backend_rdma_buffer_cpy_tensor) {
+        if (RDMA_DEBUG) fprintf(stderr, "[rdma cpy_tensor] SKIP: src not RDMA buffer\n");
+        return false;
+    }
+
+    auto * src_ctx = (ggml_backend_rdma_buffer_context *)src->buffer->context;
+
+    if (src_ctx->conn.get() != dst_ctx->conn.get()) {
+        if (RDMA_DEBUG) fprintf(stderr, "[rdma cpy_tensor] SKIP: different connection\n");
+        return false;
+    }
+
+    if (!src_ctx->base_ptr || !dst_ctx->base_ptr) {
+        if (RDMA_DEBUG) fprintf(stderr, "[rdma cpy_tensor] SKIP: base_ptr null (src=%p, dst=%p)\n",
+                                src_ctx->base_ptr, dst_ctx->base_ptr);
+        return false;
+    }
+
+    // Record deferred copy with buffer-relative offsets
+    uint64_t src_offset = reinterpret_cast<uint64_t>(src->data) - reinterpret_cast<uint64_t>(src_ctx->base_ptr);
+    uint64_t dst_offset = reinterpret_cast<uint64_t>(dst->data) - reinterpret_cast<uint64_t>(dst_ctx->base_ptr);
+    uint64_t nbytes = ggml_nbytes(src);
+
+    get_deferred_copies(dst_ctx->conn.get())->add(
+        src_ctx->remote_ptr, src_offset,
+        dst_ctx->remote_ptr, dst_offset,
+        nbytes);
+
+    if (RDMA_DEBUG) fprintf(stderr, "[rdma cpy_tensor] RECORDED: src_buf=0x%" PRIx64 "+%" PRIu64 " -> dst_buf=0x%" PRIx64 "+%" PRIu64 " (%zu B)\n",
+                 src_ctx->remote_ptr, src_offset, dst_ctx->remote_ptr, dst_offset, (size_t)nbytes);
+
+    // EXPERIMENT: also do the actual data transfer via get_tensor+set_tensor
+    // to determine if the bug is in deferred copy execution or in cpy_tensor returning true
+    static const bool VERIFY_COPY = !!std::getenv("GGML_RDMA_VERIFY_COPY");
+    if (VERIFY_COPY) {
+        std::vector<uint8_t> buf(nbytes);
+        ggml_backend_rdma_buffer_get_tensor(src->buffer, src, buf.data(), 0, nbytes);
+        ggml_backend_rdma_buffer_set_tensor(buffer, dst, buf.data(), 0, nbytes);
+        if (RDMA_DEBUG) fprintf(stderr, "[rdma cpy_tensor] VERIFY: also did get_tensor+set_tensor\n");
+    }
+
+    return true;
 }
 
 static void ggml_backend_rdma_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -1358,9 +1443,11 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
 
     GGML_ASSERT(cgraph->n_nodes > 0);
 
-    // Drain pending flushes for this device's connection only
+    // Drain pending flushes and deferred copies for this device's connection
     auto pending = get_pending_flushes(ctx->conn.get())->drain();
     uint32_t n_flush = pending.size();
+    auto copies = get_deferred_copies(ctx->conn.get())->drain();
+    uint32_t n_copies = copies.size();
 
     bool reuse = ctx->gc.is_cached(cgraph);
     if (reuse) {
@@ -1370,11 +1457,18 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
         ctx->gc.collect_updates(cgraph, updates, visited);
 
         if (updates.empty()) {
-            // Pure recompute — combine flush + recompute
-            // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) |
-            size_t input_size = sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry) + sizeof(uint32_t);
+            // Pure recompute — combine copies + flush + recompute
+            // Wire format: | n_copies(4B) | copy_entries(N*48B) | n_flush(4B) | flush_entries(M*24B) | device(4B) |
+            size_t input_size = sizeof(uint32_t) + n_copies * sizeof(deferred_copy_entry)
+                              + sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry) + sizeof(uint32_t);
             std::vector<uint8_t> input(input_size);
             uint8_t * dest = input.data();
+            memcpy(dest, &n_copies, sizeof(n_copies));
+            dest += sizeof(n_copies);
+            if (n_copies > 0) {
+                memcpy(dest, copies.data(), n_copies * sizeof(deferred_copy_entry));
+                dest += n_copies * sizeof(deferred_copy_entry);
+            }
             memcpy(dest, &n_flush, sizeof(n_flush));
             dest += sizeof(n_flush);
             if (n_flush > 0) {
@@ -1409,13 +1503,20 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
                 }
             }
         } else {
-            // Delta updates — combine flush + compute_update
-            // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) | n_updates(4B) | updates(M*100B) |
+            // Delta updates — combine copies + flush + compute_update
+            // Wire format: | n_copies(4B) | copy_entries(N*48B) | n_flush(4B) | flush_entries(M*24B) | device(4B) | n_updates(4B) | updates(K*100B) |
             uint32_t n_updates = updates.size();
-            size_t input_size = sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry)
+            size_t input_size = sizeof(uint32_t) + n_copies * sizeof(deferred_copy_entry)
+                              + sizeof(uint32_t) + n_flush * sizeof(rdma_msg_flush_entry)
                               + sizeof(uint32_t) + sizeof(uint32_t) + n_updates * sizeof(rdma_tensor_update);
             std::vector<uint8_t> input(input_size);
             uint8_t * dest = input.data();
+            memcpy(dest, &n_copies, sizeof(n_copies));
+            dest += sizeof(n_copies);
+            if (n_copies > 0) {
+                memcpy(dest, copies.data(), n_copies * sizeof(deferred_copy_entry));
+                dest += n_copies * sizeof(deferred_copy_entry);
+            }
             memcpy(dest, &n_flush, sizeof(n_flush));
             dest += sizeof(n_flush);
             if (n_flush > 0) {
@@ -1428,8 +1529,8 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             dest += sizeof(n_updates);
             memcpy(dest, updates.data(), n_updates * sizeof(rdma_tensor_update));
 
-            RDMA_LOG_DBG("[rdma] flush_and_compute_update: %u flushes + %u updates, %zu bytes\n",
-                         n_flush, n_updates, input_size);
+            RDMA_LOG_DBG("[rdma] flush_and_compute_update: %u copies + %u flushes + %u updates, %zu bytes\n",
+                         n_copies, n_flush, n_updates, input_size);
 
             uint64_t upd_send_us = 0, upd_recv_us = 0;
             if (RDMA_ASYNC_COMPUTE) {
@@ -1474,10 +1575,22 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
             RDMA_STATUS_ASSERT(flush_ok);
         }
 
-        // Detailed profiling for full graph send (experiment 1+4)
+        // Serialize graph and prepend deferred copies
+        // Wire format: | n_copies(4B) | copy_entries(N*48B) | device(4B) | n_nodes(4B) | ... |
         uint64_t t_serialize = RDMA_PROFILE ? profile_now_us() : 0;
-        std::vector<uint8_t> input;
-        serialize_graph(ctx->device, cgraph, input);
+        std::vector<uint8_t> graph_data;
+        serialize_graph(ctx->device, cgraph, graph_data);
+
+        size_t prefix_size = sizeof(uint32_t) + n_copies * sizeof(deferred_copy_entry);
+        std::vector<uint8_t> input(prefix_size + graph_data.size());
+        uint8_t * dest = input.data();
+        memcpy(dest, &n_copies, sizeof(n_copies));
+        dest += sizeof(n_copies);
+        if (n_copies > 0) {
+            memcpy(dest, copies.data(), n_copies * sizeof(deferred_copy_entry));
+            dest += n_copies * sizeof(deferred_copy_entry);
+        }
+        memcpy(dest, graph_data.data(), graph_data.size());
         uint64_t serialize_us = RDMA_PROFILE ? profile_now_us() - t_serialize : 0;
 
         uint64_t send_us = 0, recv_us = 0;
@@ -1494,9 +1607,9 @@ static enum ggml_status ggml_backend_rdma_graph_compute(ggml_backend_t backend, 
 
         if (RDMA_PROFILE) {
             uint64_t calls = g_profile.graph_compute_calls.load() + 1;
-            fprintf(stderr, "[client FULL_GRAPH%s] #%lu: serialize=%.2f ms (size=%zu), send=%.2f ms, recv=%.2f ms, n_nodes=%d\n",
+            fprintf(stderr, "[client FULL_GRAPH%s] #%lu: serialize=%.2f ms (size=%zu), send=%.2f ms, recv=%.2f ms, n_nodes=%d, n_copies=%u\n",
                     RDMA_ASYNC_COMPUTE ? " async" : "", (unsigned long)calls, serialize_us/1000.0, input.size(),
-                    send_us/1000.0, recv_us/1000.0, cgraph->n_nodes);
+                    send_us/1000.0, recv_us/1000.0, cgraph->n_nodes, n_copies);
         }
 
         // Save snapshots for future diffs
@@ -2291,6 +2404,18 @@ public:
 
         response.resize(request.size, 0);
         ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+        {
+            uint32_t nonzero = 0;
+            for (size_t j = 0; j < response.size() && j < 1024; j++) {
+                if (response[j] != 0) nonzero++;
+            }
+            fprintf(stderr, "[rdma_server] get_tensor response: %zu B, first 1024B: %u nonzero (first 8: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
+                    response.size(), nonzero,
+                    response.size() >= 8 ? response[0] : 0, response.size() >= 8 ? response[1] : 0,
+                    response.size() >= 8 ? response[2] : 0, response.size() >= 8 ? response[3] : 0,
+                    response.size() >= 8 ? response[4] : 0, response.size() >= 8 ? response[5] : 0,
+                    response.size() >= 8 ? response[6] : 0, response.size() >= 8 ? response[7] : 0);
+        }
         return true;
     }
 
@@ -2380,11 +2505,32 @@ public:
     bool graph_compute(const std::vector<uint8_t> & input) {
         uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         // serialization format:
-        // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rdma_tensor)) |
-        if (input.size() < 2*sizeof(uint32_t)) {
+        // | n_copies (4 bytes) | copy_entries (n_copies * 48 bytes) | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rdma_tensor)) |
+        if (input.size() < 3*sizeof(uint32_t)) {
             return false;
         }
         const uint8_t * src = input.data();
+        const uint8_t * end = input.data() + input.size();
+
+        // Parse and execute deferred copies
+        uint32_t n_copies;
+        memcpy(&n_copies, src, sizeof(n_copies));
+        src += sizeof(n_copies);
+        size_t copy_bytes = n_copies * sizeof(deferred_copy_entry);
+        if (src + copy_bytes > end) return false;
+        const deferred_copy_entry * copy_entries = reinterpret_cast<const deferred_copy_entry *>(src);
+        src += copy_bytes;
+
+        uint64_t copy_us = 0;
+        if (n_copies > 0) {
+            uint64_t tc = RDMA_PROFILE ? profile_now_us() : 0;
+            if (!execute_deferred_copies(copy_entries, n_copies)) {
+                GGML_LOG_ERROR("[rdma_server] graph_compute: deferred copy failed\n");
+                return false;
+            }
+            copy_us = RDMA_PROFILE ? profile_now_us() - tc : 0;
+        }
+
         uint32_t device;
         memcpy(&device, src, sizeof(device));
         src += sizeof(device);
@@ -2394,7 +2540,7 @@ public:
         uint32_t n_nodes;
         memcpy(&n_nodes, src, sizeof(n_nodes));
         src += sizeof(n_nodes);
-        if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+        if (src + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) > end) {
             return false;
         }
         const uint64_t * nodes = (const uint64_t *)src;
@@ -2402,7 +2548,7 @@ public:
         uint32_t n_tensors;
         memcpy(&n_tensors, src, sizeof(n_tensors));
         src += sizeof(n_tensors);
-        if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rdma_tensor)) {
+        if (src + n_tensors*sizeof(rdma_tensor) > end) {
             return false;
         }
         const rdma_tensor * tensors = (const rdma_tensor *)src;
@@ -2453,10 +2599,18 @@ public:
         stored_graphs_[device].graph = graph;
         stored_graphs_[device].tensor_map = std::move(tensor_map);
 
+        // Build deferred copy lookup for fix_cross_device_refs
+        std::unordered_map<void *, void *> dc_lookup;
+#ifdef GGML_RDMA_CUDA
+        if (n_copies > 0) {
+            dc_lookup = build_deferred_copy_lookup(copy_entries, n_copies);
+        }
+#endif
+
         uint64_t t_fix = 0;
 #ifdef GGML_RDMA_CUDA
         if (RDMA_PROFILE) t_fix = profile_now_us();
-        fix_cross_device_refs(graph, device, stored_graphs_[device]);
+        fix_cross_device_refs(graph, device, stored_graphs_[device], dc_lookup);
         if (RDMA_PROFILE) t_fix = profile_now_us() - t_fix;
 #endif
 
@@ -2466,13 +2620,14 @@ public:
         GGML_ASSERT(status == GGML_STATUS_SUCCESS);
         if (RDMA_PROFILE) {
             uint64_t total = profile_now_us() - t0;
-            fprintf(stderr, "[server profile] graph_compute (full): total=%.2f ms (deser=%.2f, fix_xdev=%.2f, compute=%.2f) nodes=%u tensors=%u\n",
-                    total/1000.0, deser_us/1000.0, t_fix/1000.0, compute_us/1000.0, n_nodes, n_tensors);
+            fprintf(stderr, "[server profile] graph_compute (full): total=%.2f ms (copy=%.2f n_copies=%u, deser=%.2f, fix_xdev=%.2f, compute=%.2f) nodes=%u tensors=%u\n",
+                    total/1000.0, copy_us/1000.0, n_copies, deser_us/1000.0, t_fix/1000.0, compute_us/1000.0, n_nodes, n_tensors);
         }
         return true;
     }
 
-    bool graph_recompute(const rdma_msg_graph_recompute_req & request) {
+    bool graph_recompute(const rdma_msg_graph_recompute_req & request,
+                         const std::unordered_map<void *, void *> & dc_lookup = {}) {
         uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         uint32_t device = request.device;
         if (device >= backends_.size()) {
@@ -2486,7 +2641,7 @@ public:
         uint64_t t_fix = 0;
 #ifdef GGML_RDMA_CUDA
         if (RDMA_PROFILE) t_fix = profile_now_us();
-        fix_cross_device_refs(graph, device, stored_graphs_[device]);
+        fix_cross_device_refs(graph, device, stored_graphs_[device], dc_lookup);
         if (RDMA_PROFILE) t_fix = profile_now_us() - t_fix;
 #endif
         uint64_t t_compute = RDMA_PROFILE ? profile_now_us() : 0;
@@ -2501,7 +2656,8 @@ public:
         return true;
     }
 
-    bool graph_compute_update(const std::vector<uint8_t> & input) {
+    bool graph_compute_update(const std::vector<uint8_t> & input,
+                              const std::unordered_map<void *, void *> & dc_lookup = {}) {
         uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         // Wire format: | device(4B) | n_updates(4B) | rdma_tensor_update × n_updates |
         if (input.size() < 2 * sizeof(uint32_t)) {
@@ -2556,7 +2712,7 @@ public:
         uint64_t t_fix = 0;
 #ifdef GGML_RDMA_CUDA
         if (RDMA_PROFILE) t_fix = profile_now_us();
-        fix_cross_device_refs(graph, device, stored_graphs_[device]);
+        fix_cross_device_refs(graph, device, stored_graphs_[device], dc_lookup);
         if (RDMA_PROFILE) t_fix = profile_now_us() - t_fix;
 #endif
         uint64_t t_compute = RDMA_PROFILE ? profile_now_us() : 0;
@@ -2612,6 +2768,84 @@ public:
         // Non-CUDA: staging buffer IS the buffer (host memory), no copy needed
         (void)request;
         RDMA_LOG_DBG("[rdma_server] flush_staging: no-op (non-CUDA)\n");
+#endif
+        return true;
+    }
+
+    // Execute deferred cross-device copies via cudaMemcpyPeer on the server.
+    // Each entry specifies src/dst buffer (as ggml_backend_buffer_t pointers) and offsets.
+    // The server resolves GPU addresses and device IDs from its buffer maps.
+    bool execute_deferred_copies(const deferred_copy_entry * entries, uint32_t n_entries) {
+#ifdef GGML_RDMA_CUDA
+        if (n_entries == 0) return true;
+        uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
+
+        for (uint32_t i = 0; i < n_entries; i++) {
+            const deferred_copy_entry & e = entries[i];
+            ggml_backend_buffer_t src_buf = reinterpret_cast<ggml_backend_buffer_t>(e.src_buffer);
+            ggml_backend_buffer_t dst_buf = reinterpret_cast<ggml_backend_buffer_t>(e.dst_buffer);
+
+            if (buffers_.find(src_buf) == buffers_.end() || buffers_.find(dst_buf) == buffers_.end()) {
+                GGML_LOG_ERROR("[rdma_server] deferred_copy: invalid buffer pointer (src=%p in_set=%d, dst=%p in_set=%d)\n",
+                               (void*)src_buf, buffers_.count(src_buf), (void*)dst_buf, buffers_.count(dst_buf));
+                return false;
+            }
+
+            void * src_base = ggml_backend_buffer_get_base(src_buf);
+            void * dst_base = ggml_backend_buffer_get_base(dst_buf);
+            uint32_t src_dev = buffer_device_map_[src_buf];
+            uint32_t dst_dev = buffer_device_map_[dst_buf];
+
+            void * src_ptr = static_cast<uint8_t *>(src_base) + e.src_offset;
+            void * dst_ptr = static_cast<uint8_t *>(dst_base) + e.dst_offset;
+
+            size_t src_buf_size = ggml_backend_buffer_get_size(src_buf);
+            size_t dst_buf_size = ggml_backend_buffer_get_size(dst_buf);
+
+            if (e.src_offset + e.size > src_buf_size) {
+                GGML_LOG_ERROR("[rdma_server] deferred_copy: src out of bounds (%lu + %lu > %zu)\n",
+                               (unsigned long)e.src_offset, (unsigned long)e.size, src_buf_size);
+                return false;
+            }
+            if (e.dst_offset + e.size > dst_buf_size) {
+                GGML_LOG_ERROR("[rdma_server] deferred_copy: dst out of bounds (%lu + %lu > %zu)\n",
+                               (unsigned long)e.dst_offset, (unsigned long)e.size, dst_buf_size);
+                return false;
+            }
+
+            cudaSetDevice(src_dev);
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] deferred_copy: cudaDeviceSynchronize(src_dev=%u) failed: %s\n",
+                               src_dev, cudaGetErrorString(err));
+            }
+
+            std::vector<uint8_t> host_buf(e.size);
+            err = cudaMemcpy(host_buf.data(), src_ptr, e.size, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] deferred_copy D2H failed (dev %u, %zu B): %s\n",
+                               src_dev, (size_t)e.size, cudaGetErrorString(err));
+                return false;
+            }
+
+            cudaSetDevice(dst_dev);
+            err = cudaMemcpy(dst_ptr, host_buf.data(), e.size, cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("[rdma_server] deferred_copy H2D failed (dev %u, %zu B): %s\n",
+                               dst_dev, (size_t)e.size, cudaGetErrorString(err));
+                return false;
+            }
+
+        }
+
+        if (RDMA_PROFILE) {
+            uint64_t total = profile_now_us() - t0;
+            fprintf(stderr, "[server profile] deferred_copies: %.2f ms (%u entries)\n",
+                    total/1000.0, n_entries);
+        }
+#else
+        (void)entries;
+        (void)n_entries;
 #endif
         return true;
     }
@@ -2681,21 +2915,37 @@ public:
         return true;
     }
 
-    // Combined flush + recompute in one round-trip
-    // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) |
+    // Combined deferred_copies + flush + recompute in one round-trip
+    // Wire format: | n_copies(4B) | copy_entries(N*48B) | n_flush(4B) | flush_entries(M*24B) | device(4B) |
     bool flush_and_recompute(const std::vector<uint8_t> & input) {
         uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         const uint8_t * src = input.data();
+        const uint8_t * end = input.data() + input.size();
         if (input.size() < sizeof(uint32_t)) return false;
 
+        // Parse deferred copies
+        uint32_t n_copies;
+        memcpy(&n_copies, src, sizeof(n_copies));
+        src += sizeof(n_copies);
+
+        size_t copy_bytes = n_copies * sizeof(deferred_copy_entry);
+        if (src + copy_bytes > end) return false;
+        const deferred_copy_entry * copy_entries = reinterpret_cast<const deferred_copy_entry *>(src);
+        src += copy_bytes;
+
+        // Parse flush entries
+        if (src + sizeof(uint32_t) > end) return false;
         uint32_t n_flush;
         memcpy(&n_flush, src, sizeof(n_flush));
         src += sizeof(n_flush);
 
         size_t flush_bytes = n_flush * sizeof(rdma_msg_flush_entry);
-        if (input.size() < sizeof(uint32_t) + flush_bytes + sizeof(uint32_t)) return false;
+        if (src + flush_bytes + sizeof(uint32_t) > end) return false;
 
-        // Flush staging if needed
+        // Flush staging FIRST (bounding box may overlap deferred copy destinations,
+        // and staging contains stale data at those offsets from previous set_tensor calls).
+        // Deferred copies run AFTER flush to overwrite with fresh cross-device data.
+        // This matches FULL_GRAPH order: separate FLUSH_ALL_STAGING → GRAPH_COMPUTE with copies.
         uint64_t flush_us = 0;
         if (n_flush > 0) {
             std::vector<uint8_t> flush_data(src, src + flush_bytes);
@@ -2704,35 +2954,64 @@ public:
             flush_us = RDMA_PROFILE ? profile_now_us() - tf : 0;
             src += flush_bytes;
         }
+
+        // Execute deferred copies AFTER flush (needs source device compute to be complete)
+        uint64_t copy_us = 0;
+        if (n_copies > 0) {
+            uint64_t tc = RDMA_PROFILE ? profile_now_us() : 0;
+            if (!execute_deferred_copies(copy_entries, n_copies)) return false;
+            copy_us = RDMA_PROFILE ? profile_now_us() - tc : 0;
+        }
+
+        // Build deferred copy lookup for fix_cross_device_refs
+        std::unordered_map<void *, void *> dc_lookup;
+#ifdef GGML_RDMA_CUDA
+        if (n_copies > 0) {
+            dc_lookup = build_deferred_copy_lookup(copy_entries, n_copies);
+        }
+#endif
 
         // Recompute
         rdma_msg_graph_recompute_req request;
         memcpy(&request.device, src, sizeof(request.device));
-        bool ok = graph_recompute(request);
+        bool ok = graph_recompute(request, dc_lookup);
 
         if (RDMA_PROFILE) {
             uint64_t total = profile_now_us() - t0;
-            fprintf(stderr, "[server profile] flush_and_recompute: total=%.2f ms (flush=%.2f, n_flush=%u)\n",
-                    total/1000.0, flush_us/1000.0, n_flush);
+            fprintf(stderr, "[server profile] flush_and_recompute: total=%.2f ms (copy=%.2f n_copies=%u, flush=%.2f n_flush=%u)\n",
+                    total/1000.0, copy_us/1000.0, n_copies, flush_us/1000.0, n_flush);
         }
         return ok;
     }
 
-    // Combined flush + compute_update in one round-trip
-    // Wire format: | n_flush(4B) | flush_entries(N*24B) | device(4B) | n_updates(4B) | updates(M*100B) |
+    // Combined deferred_copies + flush + compute_update in one round-trip
+    // Wire format: | n_copies(4B) | copy_entries(N*48B) | n_flush(4B) | flush_entries(M*24B) | device(4B) | n_updates(4B) | updates(K*100B) |
     bool flush_and_compute_update(const std::vector<uint8_t> & input) {
         uint64_t t0 = RDMA_PROFILE ? profile_now_us() : 0;
         const uint8_t * src = input.data();
+        const uint8_t * end = input.data() + input.size();
         if (input.size() < sizeof(uint32_t)) return false;
 
+        // Parse deferred copies
+        uint32_t n_copies;
+        memcpy(&n_copies, src, sizeof(n_copies));
+        src += sizeof(n_copies);
+
+        size_t copy_bytes = n_copies * sizeof(deferred_copy_entry);
+        if (src + copy_bytes > end) return false;
+        const deferred_copy_entry * copy_entries = reinterpret_cast<const deferred_copy_entry *>(src);
+        src += copy_bytes;
+
+        // Parse flush entries
+        if (src + sizeof(uint32_t) > end) return false;
         uint32_t n_flush;
         memcpy(&n_flush, src, sizeof(n_flush));
         src += sizeof(n_flush);
 
         size_t flush_bytes = n_flush * sizeof(rdma_msg_flush_entry);
-        if (input.size() < sizeof(uint32_t) + flush_bytes + 2 * sizeof(uint32_t)) return false;
+        if (src + flush_bytes > end) return false;
 
-        // Flush staging if needed
+        // Flush staging FIRST (bounding box may overlap deferred copy destinations)
         uint64_t flush_us = 0;
         if (n_flush > 0) {
             std::vector<uint8_t> flush_data(src, src + flush_bytes);
@@ -2742,15 +3021,31 @@ public:
             src += flush_bytes;
         }
 
+        // Execute deferred copies AFTER flush
+        uint64_t copy_us = 0;
+        if (n_copies > 0) {
+            uint64_t tc = RDMA_PROFILE ? profile_now_us() : 0;
+            if (!execute_deferred_copies(copy_entries, n_copies)) return false;
+            copy_us = RDMA_PROFILE ? profile_now_us() - tc : 0;
+        }
+
+        // Build deferred copy lookup for fix_cross_device_refs
+        std::unordered_map<void *, void *> dc_lookup;
+#ifdef GGML_RDMA_CUDA
+        if (n_copies > 0) {
+            dc_lookup = build_deferred_copy_lookup(copy_entries, n_copies);
+        }
+#endif
+
         // Compute update — remaining bytes are the compute_update payload
         size_t remaining = input.size() - (src - input.data());
         std::vector<uint8_t> compute_data(src, src + remaining);
-        bool ok = graph_compute_update(compute_data);
+        bool ok = graph_compute_update(compute_data, dc_lookup);
 
         if (RDMA_PROFILE) {
             uint64_t total = profile_now_us() - t0;
-            fprintf(stderr, "[server profile] flush_and_compute_update: total=%.2f ms (flush=%.2f, n_flush=%u)\n",
-                    total/1000.0, flush_us/1000.0, n_flush);
+            fprintf(stderr, "[server profile] flush_and_compute_update: total=%.2f ms (copy=%.2f n_copies=%u, flush=%.2f n_flush=%u)\n",
+                    total/1000.0, copy_us/1000.0, n_copies, flush_us/1000.0, n_flush);
         }
         return ok;
     }
@@ -2828,9 +3123,31 @@ private:
     }
 
 #ifdef GGML_RDMA_CUDA
+    // Build a lookup map from deferred copy entries: src GPU address → dst GPU address.
+    // Used by fix_cross_device_refs to skip D2H→H2D copies for data already moved by deferred copy.
+    std::unordered_map<void *, void *> build_deferred_copy_lookup(
+            const deferred_copy_entry * entries, uint32_t n_entries) {
+        std::unordered_map<void *, void *> lookup;
+        for (uint32_t i = 0; i < n_entries; i++) {
+            const deferred_copy_entry & e = entries[i];
+            auto src_buf = reinterpret_cast<ggml_backend_buffer_t>(e.src_buffer);
+            auto dst_buf = reinterpret_cast<ggml_backend_buffer_t>(e.dst_buffer);
+            if (buffers_.find(src_buf) == buffers_.end() || buffers_.find(dst_buf) == buffers_.end()) continue;
+            void * src_ptr = static_cast<uint8_t *>(ggml_backend_buffer_get_base(src_buf)) + e.src_offset;
+            void * dst_ptr = static_cast<uint8_t *>(ggml_backend_buffer_get_base(dst_buf)) + e.dst_offset;
+            lookup[src_ptr] = dst_ptr;
+        }
+        return lookup;
+    }
+
     // Fix cross-device tensor access by copying data from foreign devices to target device via host memory.
     // This is a safety net for cases where the scheduler doesn't properly split graphs across devices.
-    void fix_cross_device_refs(ggml_cgraph * graph, uint32_t device, stored_graph & sg) {
+    // dc_lookup: optional map from deferred copy (src_ptr → dst_ptr) to avoid redundant copies.
+    void fix_cross_device_refs(ggml_cgraph * graph, uint32_t device, stored_graph & sg,
+                               const std::unordered_map<void *, void *> & dc_lookup = {}) {
+        if (!dc_lookup.empty()) {
+            fprintf(stderr, "[fix_xdev] device=%u, dc_lookup has %zu entries\n", device, dc_lookup.size());
+        }
         // Free previous cross-device allocations
         if (!sg.cross_device_allocs.empty()) {
             cudaSetDevice(device);
@@ -2851,6 +3168,19 @@ private:
                 t->data = cp->second;
                 return;
             }
+
+            // Check if data was already copied by deferred copy (server-side cudaMemcpyPeer)
+            auto dc = dc_lookup.find(t->data);
+            if (dc != dc_lookup.end()) {
+                fprintf(stderr, "[fix_xdev] DC HIT: %s data=%p -> %p (dev %u -> %u, %zu B)\n",
+                        t->name, t->data, dc->second, bit->second, device, ggml_nbytes(t));
+                copied_ptrs[t->data] = dc->second;
+                t->data = dc->second;
+                return;
+            }
+
+            fprintf(stderr, "[fix_xdev] DC MISS (fallback D2H+H2D): %s data=%p buf=%p (dev %u -> %u, %zu B)\n",
+                    t->name, t->data, (void*)t->buffer, bit->second, device, ggml_nbytes(t));
 
             size_t nbytes = ggml_nbytes(t);
             void * new_ptr = nullptr;
