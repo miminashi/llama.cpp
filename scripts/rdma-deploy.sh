@@ -5,9 +5,15 @@ NODE2="192.168.100.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKTREE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REMOTE_DIR="/home/ubuntu/projects/llama.cpp"
-CMAKE_OPTS="-DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=60"
+BUILD_TYPE="${1:-release}"
+case "$BUILD_TYPE" in
+    debug)   CMAKE_BUILD_TYPE="Debug" ;;
+    release) CMAKE_BUILD_TYPE="Release" ;;
+    *)       echo "Usage: $0 [debug|release]"; echo "  debug   - Build with -O0 -g3 (for gdb)"; echo "  release - Build with optimizations (default)"; exit 1 ;;
+esac
+CMAKE_OPTS="-DGGML_RDMA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=60 -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
 
-echo "=== Deploying to node 2 ($NODE2) ==="
+echo "=== Deploying to node 2 ($NODE2) [${CMAKE_BUILD_TYPE}] ==="
 
 echo "[1/3] Removing old code on node 2..."
 ssh "$NODE2" "rm -rf ${REMOTE_DIR}"

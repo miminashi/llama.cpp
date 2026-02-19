@@ -1,0 +1,327 @@
+# gdbinit-rdma — GDB helpers for RDMA backend debugging
+# Usage: gdb -x scripts/gdbinit-rdma --args ./build/bin/llama-cli ...
+
+# --- Signal handling ---
+handle SIGPIPE nostop noprint pass
+handle SIGUSR1 nostop noprint pass
+handle SIGUSR2 nostop noprint pass
+
+# --- Basic settings ---
+set pagination off
+set print pretty on
+set print thread-events on
+set breakpoint pending on
+
+# ============================================================
+# RDMA Inspection Commands
+# ============================================================
+
+define rdma-conn
+    if $argc != 1
+        printf "Usage: rdma-conn <rdma_connection*>\n"
+    else
+        set $c = ($arg0)
+        printf "=== rdma_connection @ %p ===\n", $c
+        printf "  endpoint:        %s\n", $c->endpoint_.c_str()
+        printf "  connected:       %d\n", (int)$c->connected_
+        printf "  compute_pending: %d\n", (int)$c->compute_pending_.load()
+        printf "  cm_id:           %p\n", $c->cm_id_
+        printf "  pd:              %p\n", $c->pd_
+        printf "  cq:              %p\n", $c->cq_
+        printf "  qp:              %p\n", $c->qp_
+        printf "  --- stats ---\n"
+        printf "    bytes_sent:     %lu\n", $c->stats_.bytes_sent.load()
+        printf "    bytes_received: %lu\n", $c->stats_.bytes_received.load()
+        printf "    rdma_writes:    %lu\n", $c->stats_.rdma_writes.load()
+        printf "    rdma_reads:     %lu\n", $c->stats_.rdma_reads.load()
+        printf "    send_ops:       %lu\n", $c->stats_.send_ops.load()
+        printf "    recv_ops:       %lu\n", $c->stats_.recv_ops.load()
+    end
+end
+document rdma-conn
+Display rdma_connection state: endpoint, connected, QP, stats.
+Usage: rdma-conn <rdma_connection*>
+end
+
+define rdma-buf
+    if $argc != 1
+        printf "Usage: rdma-buf <ggml_backend_rdma_buffer_context*>\n"
+    else
+        set $b = ($arg0)
+        printf "=== rdma_buffer_context @ %p ===\n", $b
+        printf "  base_ptr:            %p\n", $b->base_ptr
+        printf "  remote_ptr:          0x%lx\n", (unsigned long)$b->remote_ptr
+        printf "  mr_addr:             0x%lx\n", (unsigned long)$b->mr_addr
+        printf "  mr_rkey:             0x%x\n", $b->mr_rkey
+        printf "  size:                %zu\n", $b->size
+        printf "  mr_is_gdr:           %d\n", (int)$b->mr_is_gdr
+        printf "  rdma_write_disabled: %d\n", (int)$b->rdma_write_disabled
+    end
+end
+document rdma-buf
+Display ggml_backend_rdma_buffer_context fields.
+Usage: rdma-buf <ggml_backend_rdma_buffer_context*>
+end
+
+define rdma-ctx
+    if $argc != 1
+        printf "Usage: rdma-ctx <ggml_backend_rdma_context*>\n"
+    else
+        set $x = ($arg0)
+        printf "=== rdma_context @ %p ===\n", $x
+        printf "  endpoint:    %s\n", $x->endpoint.c_str()
+        printf "  device:      %u\n", $x->device
+        printf "  name:        %s\n", $x->name.c_str()
+        printf "  gdr_enabled: %d\n", (int)$x->gdr_enabled
+        printf "  conn:        %p\n", $x->conn.get()
+        if $x->conn.get() != 0
+            printf "  --- connection summary ---\n"
+            printf "    connected:       %d\n", (int)$x->conn.get()->connected_
+            printf "    compute_pending: %d\n", (int)$x->conn.get()->compute_pending_.load()
+        end
+    end
+end
+document rdma-ctx
+Display ggml_backend_rdma_context fields with connection summary.
+Usage: rdma-ctx <ggml_backend_rdma_context*>
+end
+
+define rdma-wc
+    if $argc != 1
+        printf "Usage: rdma-wc <ibv_wc*>\n"
+    else
+        set $w = ($arg0)
+        printf "=== ibv_wc @ %p ===\n", $w
+        printf "  status:      %d", $w->status
+        if $w->status == 0
+            printf " (SUCCESS)\n"
+        else
+            printf " (ERROR)\n"
+        end
+        printf "  opcode:      %d\n", $w->opcode
+        printf "  vendor_err:  0x%x\n", $w->vendor_err
+        printf "  byte_len:    %u\n", $w->byte_len
+        printf "  imm_data:    0x%x\n", $w->imm_data
+        printf "  qp_num:      %u\n", $w->qp_num
+    end
+end
+document rdma-wc
+Display ibv_wc (Work Completion) fields.
+Usage: rdma-wc <ibv_wc*>
+end
+
+define rdma-mr
+    if $argc != 1
+        printf "Usage: rdma-mr <ibv_mr*>\n"
+    else
+        set $m = ($arg0)
+        printf "=== ibv_mr @ %p ===\n", $m
+        printf "  addr:   %p\n", $m->addr
+        printf "  length: %zu\n", $m->length
+        printf "  lkey:   0x%x\n", $m->lkey
+        printf "  rkey:   0x%x\n", $m->rkey
+    end
+end
+document rdma-mr
+Display ibv_mr (Memory Region) fields.
+Usage: rdma-mr <ibv_mr*>
+end
+
+define rdma-cmd-name
+    if $argc != 1
+        printf "Usage: rdma-cmd-name <id>\n"
+    else
+        set $id = (int)($arg0)
+        if $id == 0
+            printf "ALLOC_BUFFER\n"
+        end
+        if $id == 1
+            printf "GET_ALIGNMENT\n"
+        end
+        if $id == 2
+            printf "GET_MAX_SIZE\n"
+        end
+        if $id == 3
+            printf "BUFFER_GET_BASE\n"
+        end
+        if $id == 4
+            printf "FREE_BUFFER\n"
+        end
+        if $id == 5
+            printf "BUFFER_CLEAR\n"
+        end
+        if $id == 6
+            printf "SET_TENSOR\n"
+        end
+        if $id == 7
+            printf "GET_TENSOR\n"
+        end
+        if $id == 8
+            printf "COPY_TENSOR\n"
+        end
+        if $id == 9
+            printf "GRAPH_COMPUTE\n"
+        end
+        if $id == 10
+            printf "GET_DEVICE_MEMORY\n"
+        end
+        if $id == 11
+            printf "INIT_TENSOR\n"
+        end
+        if $id == 12
+            printf "GET_ALLOC_SIZE\n"
+        end
+        if $id == 13
+            printf "HELLO\n"
+        end
+        if $id == 14
+            printf "DEVICE_COUNT\n"
+        end
+        if $id == 15
+            printf "GRAPH_RECOMPUTE\n"
+        end
+        if $id == 16
+            printf "REGISTER_MR\n"
+        end
+        if $id == 17
+            printf "DEREGISTER_MR\n"
+        end
+        if $id == 18
+            printf "GET_MR_INFO\n"
+        end
+        if $id == 19
+            printf "RDMA_WRITE_DONE\n"
+        end
+        if $id == 20
+            printf "RDMA_READ_DONE\n"
+        end
+        if $id == 21
+            printf "GRAPH_COMPUTE_UPDATE\n"
+        end
+        if $id == 22
+            printf "FLUSH_STAGING\n"
+        end
+        if $id == 23
+            printf "FLUSH_ALL_STAGING\n"
+        end
+        if $id == 24
+            printf "FLUSH_AND_RECOMPUTE\n"
+        end
+        if $id == 25
+            printf "FLUSH_AND_COMPUTE_UPDATE\n"
+        end
+        if $id == 26
+            printf "FLUSH_AND_RECOMPUTE_ASYNC\n"
+        end
+        if $id == 27
+            printf "FLUSH_AND_COMPUTE_UPDATE_ASYNC\n"
+        end
+        if $id == 28
+            printf "GRAPH_COMPUTE_ASYNC\n"
+        end
+        if $id == 29
+            printf "CMD_COUNT\n"
+        end
+        if $id < 0 || $id > 29
+            printf "UNKNOWN (id=%d)\n", $id
+        end
+    end
+end
+document rdma-cmd-name
+Translate rdma_cmd enum value to name.
+Usage: rdma-cmd-name <id>
+Example: rdma-cmd-name 9  => GRAPH_COMPUTE
+end
+
+define rdma-threads
+    info threads
+    printf "\nHint: RDMA threads typically include:\n"
+    printf "  - Main thread (client llama-cli / server accept loop)\n"
+    printf "  - Server command handler thread(s)\n"
+    printf "  - Compute worker thread(s) (if parallel compute enabled)\n"
+    printf "  - Compute dispatcher thread (if parallel compute enabled)\n"
+end
+document rdma-threads
+Show all threads with RDMA-specific hints.
+end
+
+# ============================================================
+# Breakpoint Presets
+# ============================================================
+
+define rdma-bp-errors
+    printf "Setting RDMA error breakpoints...\n"
+    break rdma-transport.cpp:450
+    break rdma-transport.cpp:514
+    break rdma-transport.cpp:593
+    break rdma-transport.cpp:636
+    break rdma-transport.cpp:685
+    printf "5 breakpoints set (send/recv/write/read timeout + WC error)\n"
+end
+document rdma-bp-errors
+Set breakpoints on RDMA transport error paths:
+  - Send completion timeout (rdma-transport.cpp:450)
+  - Recv completion timeout (rdma-transport.cpp:514)
+  - RDMA Write completion timeout (rdma-transport.cpp:593)
+  - RDMA Read completion timeout (rdma-transport.cpp:636)
+  - Work completion error (rdma-transport.cpp:685)
+end
+
+define rdma-bp-commands
+    printf "Setting server command dispatch breakpoint...\n"
+    break ggml-rdma.cpp:3438
+    commands
+        silent
+        printf "[rdma-cmd] cmd=%d ", cmd
+        rdma-cmd-name cmd
+        continue
+    end
+    printf "1 tracing breakpoint set (server command dispatch)\n"
+end
+document rdma-bp-commands
+Set a tracing breakpoint on server command dispatch (ggml-rdma.cpp:3438).
+Prints command name for each dispatched command and continues.
+end
+
+define rdma-bp-compute
+    printf "Setting compute-related breakpoints...\n"
+    break ggml-rdma.cpp:3555
+    break ggml-rdma.cpp:3569
+    break ggml-rdma.cpp:3585
+    break ggml-rdma.cpp:3672
+    printf "4 breakpoints set (GRAPH_COMPUTE, GRAPH_RECOMPUTE, GRAPH_COMPUTE_UPDATE, GRAPH_COMPUTE_ASYNC)\n"
+end
+document rdma-bp-compute
+Set breakpoints on graph_compute related commands:
+  - GRAPH_COMPUTE (ggml-rdma.cpp:3555)
+  - GRAPH_RECOMPUTE (ggml-rdma.cpp:3569)
+  - GRAPH_COMPUTE_UPDATE (ggml-rdma.cpp:3585)
+  - GRAPH_COMPUTE_ASYNC (ggml-rdma.cpp:3672)
+end
+
+# ============================================================
+# Startup Message
+# ============================================================
+
+printf "\n"
+printf "========================================\n"
+printf "  RDMA GDB Helpers Loaded\n"
+printf "========================================\n"
+printf "\n"
+printf "Inspection commands:\n"
+printf "  rdma-conn <ptr>     - rdma_connection state\n"
+printf "  rdma-buf  <ptr>     - buffer context fields\n"
+printf "  rdma-ctx  <ptr>     - backend context + conn\n"
+printf "  rdma-wc   <ptr>     - work completion entry\n"
+printf "  rdma-mr   <ptr>     - memory region info\n"
+printf "  rdma-cmd-name <id>  - command ID to name\n"
+printf "  rdma-threads        - thread list + hints\n"
+printf "\n"
+printf "Breakpoint presets:\n"
+printf "  rdma-bp-errors      - transport error paths\n"
+printf "  rdma-bp-commands    - server cmd dispatch trace\n"
+printf "  rdma-bp-compute     - graph_compute breakpoints\n"
+printf "\n"
+printf "Tip: use GGML_RDMA_TIMEOUT_MS=120000 for debug builds\n"
+printf "========================================\n"
+printf "\n"

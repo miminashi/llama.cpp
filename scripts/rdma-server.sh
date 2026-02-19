@@ -6,13 +6,17 @@ PROJECT_DIR="/home/ubuntu/projects/llama.cpp"
 HOST="0.0.0.0"
 PORT="50051"
 
+GDBINIT_REMOTE="${PROJECT_DIR}/scripts/gdbinit-rdma"
+
 usage() {
-    echo "Usage: $0 {start|stop|restart|status|log}"
+    echo "Usage: $0 {start|stop|restart|status|log|debug|attach}"
     echo "  start   - Start rdma-server on node 2"
     echo "  stop    - Stop rdma-server on node 2"
     echo "  restart - Restart rdma-server on node 2"
     echo "  status  - Check if rdma-server is running on node 2"
     echo "  log     - Show recent rdma-server log from node 2"
+    echo "  debug   - Start rdma-server under gdb on node 2 (foreground)"
+    echo "  attach  - Attach gdb to running rdma-server on node 2"
     exit 1
 }
 
@@ -48,6 +52,17 @@ server_log() {
     ssh "$NODE2" "tail -50 /tmp/rdma-server.log 2>/dev/null || echo 'No log file found'"
 }
 
+server_debug() {
+    echo "Starting rdma-server under gdb on $NODE2 (foreground, interactive)..."
+    echo "Note: this requires an interactive terminal (ssh -t)"
+    ssh -t "$NODE2" "LD_LIBRARY_PATH=${PROJECT_DIR}/build/bin gdb -x ${GDBINIT_REMOTE} --args ${PROJECT_DIR}/build/bin/rdma-server -H $HOST -p $PORT"
+}
+
+server_attach() {
+    echo "Attaching gdb to running rdma-server on $NODE2..."
+    ssh -t "$NODE2" "PID=\$(pgrep -f rdma-server | head -1) && echo \"Attaching to PID=\$PID\" && LD_LIBRARY_PATH=${PROJECT_DIR}/build/bin gdb -x ${GDBINIT_REMOTE} -p \$PID || echo 'rdma-server not running'"
+}
+
 [ $# -lt 1 ] && usage
 
 case "$1" in
@@ -56,5 +71,7 @@ case "$1" in
     restart) server_restart ;;
     status)  server_status ;;
     log)     server_log ;;
+    debug)   server_debug ;;
+    attach)  server_attach ;;
     *)       usage ;;
 esac
