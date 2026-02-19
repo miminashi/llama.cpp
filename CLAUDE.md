@@ -159,6 +159,76 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 
 ---
 
+## GPUDirect RDMA (GDR) の有効化
+
+### 前提条件
+
+| 要件 | 現環境 | 備考 |
+|------|--------|------|
+| NVIDIA Driver R470+ | 535.288.01 | `nvidia-peermem` モジュール同梱 |
+| MLNX_OFED | 24.10-1.1.4.0 | InfiniBand/RoCE ドライバ |
+| ConnectX-4+ RNIC | mlx5_0 (CX-4) | FW 12.21.1000 |
+| Compute Capability 3.5+ | P100 (6.0) | GPUDirect RDMA の最低要件 |
+
+### カーネルモジュール: `nvidia-peermem`
+
+> **よくある間違い**: `nv_peer_mem` は旧名 (Driver R470 未満 + Mellanox 提供の別パッケージ)。
+> Driver R470 以降は `nvidia-peermem` がドライバに同梱されており、`nv_peer_mem` は存在しない。
+
+| 名前の使い分け | 記法 | 用途 |
+|---------------|------|------|
+| ハイフン区切り | `nvidia-peermem` | `modprobe`, `modinfo`, 設定ファイル |
+| アンダースコア区切り | `nvidia_peermem` | `lsmod` 出力, `/sys/module/`, `/proc/modules` |
+
+```bash
+# モジュールの手動ロード
+sudo modprobe nvidia-peermem
+
+# 起動時の自動ロード設定 (両ノード)
+echo 'nvidia-peermem' | sudo tee /etc/modules-load.d/nvidia-peermem.conf
+```
+
+### GDR 状態確認コマンド
+
+```bash
+# モジュールがロードされているか
+lsmod | grep nvidia_peermem
+
+# モジュールの詳細情報 (バージョン、依存関係)
+modinfo nvidia-peermem
+
+# sysfs での状態確認 (live = 正常)
+cat /sys/module/nvidia_peermem/initstate
+
+# 2号機も同様に確認
+ssh 192.168.100.2 "lsmod | grep nvidia_peermem"
+```
+
+### トラブルシューティング
+
+| 症状 | 原因 | 対処法 |
+|------|------|--------|
+| `modprobe nv_peer_mem` → module not found | 旧モジュール名を指定している | `modprobe nvidia-peermem` を使う |
+| `modprobe nvidia-peermem` → module not found | NVIDIA ドライバが R470 未満 or DKMS 再ビルドが必要 | `nvidia-smi` でバージョン確認、`dkms status` で確認 |
+| `lsmod` に `nvidia_peermem` がない | モジュール未ロード | `sudo modprobe nvidia-peermem` |
+| RDMA バックエンドログに `nvidia-peermem module not loaded` | サーバー側でモジュール未ロード | 2号機でも `modprobe` 実行 |
+| `ibv_reg_mr` 失敗 (GPU アドレス) | peermem 未ロード or ドライバ不整合 | `modinfo nvidia-peermem` でバージョンが `nvidia-smi` と一致するか確認 |
+| RDMA Write タイムアウト (大モデル) | ConnectX-4 MTT キャッシュ溢れ | `GGML_RDMA_GDR_BUDGET_GB=12` (デフォルト) で制限 |
+
+### RDMA バックエンドでの GDR 設定
+
+GDR は `nvidia_peermem` モジュールがロードされていれば**自動的に有効化**される。
+コード側の検出ロジック (`ggml/src/ggml-rdma/rdma-gdr.cpp`):
+1. `/sys/module/nvidia_peermem/initstate` が `live` であることを確認
+2. フォールバック: `/proc/modules` に `nvidia_peermem` が含まれるか確認
+
+手動制御:
+- **無効化**: `GGML_RDMA_NO_GDR=1` (全 GPU をホストステージング経由に)
+- **バジェット調整**: `GGML_RDMA_GDR_BUDGET_GB=12` (デフォルト、ConnectX-4 向け)
+  - ConnectX-6+ では `50` 等に増やすことで全デバイス GDR 化が可能
+
+---
+
 ## ビルド・デプロイ・実行手順
 
 > **注意**: SSH/rsync コマンドは `settings.local.json` に `Bash(ssh *)` 等を含めれば直接実行可能。
