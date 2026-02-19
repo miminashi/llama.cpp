@@ -14,8 +14,10 @@
 - **マルチラインコマンドを避ける**: 改行区切りの複数コマンドはパーミッション自動承認が効かない。`&&` や `;` で1行にまとめるか、複数の Bash 呼び出しに分割すること。ただし `&&`/`;` チェインもビルトイン安全コマンド（`echo`, `true` 等）以外の異種コマンドの組み合わせでは自動承認されないため、複数 Bash 呼び出しへの分割が最も確実
 - **ファイルへのリダイレクトを使わない**: `2>/tmp/file.log` や `>/tmp/file.log` 等のファイルリダイレクトはパーミッション自動承認が効かない（`2>/dev/null` と `2>&1` のみ許可）。stderr をファイルに保存したい場合は、Bash ツールの出力を直接利用すること
 - **パーミッション設定の優先順位**: プロジェクト `settings.local.json` に `permissions.allow` がある場合、グローバル `settings.local.json` の `permissions.allow` は置換される（マージされない）。プロジェクト設定には必要なグローバルパターンも含めること。ワークツリーの場合、メインリポジトリの `.claude/settings.local.json` が読まれるため、設定変更はメインリポジトリ側で行うこと
-- **SSH コマンドを直接使わない**: `ssh`, `rsync`, `scp` はパーミッション自動承認が効かない (Claude Code の既知の制限)。代わりに `scripts/rdma-*.sh` ラッパースクリプトを `bash scripts/rdma-*.sh` で呼び出すこと
+- **SSH コマンド**: `ssh`, `rsync`, `scp` は `settings.local.json` に `Bash(ssh *)` 等を含めれば自動承認される。ただし、2号機でのビルド・デプロイ・サーバー管理には `scripts/rdma-*.sh` ラッパースクリプトを推奨（エラーハンドリング・ログ管理が組み込まれているため）
 - **`git -C` を使わない**: `Bash(git -C *)` は push 等の破壊的コマンドも許可するため安全でない。代替手段: (1) 対象ディレクトリに `cd` してから `git` を実行 (`cd /path && git status`)、(2) 現在のワークツリーで作業中なら `-C` は不要
+- **別ワークツリーでのコマンド実行**: `cd /path/to/worktree && bash scripts/...` パターンは使わない（`cd` は非ビルトインのため `&&` チェインが自動承認されない）。代わりに**絶対パス**でスクリプトやバイナリを呼ぶ: `bash /absolute/path/to/worktree/scripts/rdma-build.sh local`。`rdma-*.sh` スクリプトは `$(dirname "$0")` でパス解決するため任意のディレクトリから呼べる。バイナリ実行も絶対パスを使う: `/absolute/path/to/worktree/build/bin/llama-cli ...`
+- **ツールのパスに `~` を使わない**: Read, Glob, Grep 等のツールは `~` をシェル展開しない。`~/projects/...` ではなく `/home/ubuntu/projects/...` のように絶対パスを使うこと
 - **ワークツリー**: 修正作業を行う際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する
 - **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/report/` に作成する
 
@@ -119,9 +121,10 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 
 ## ビルド・デプロイ・実行手順
 
-> **重要**: SSH/rsync コマンドは Claude Code のパーミッション自動承認が効かないため、
-> ラッパースクリプト (`scripts/rdma-*.sh`) 経由で実行すること。
-> スクリプトは `bash scripts/rdma-*.sh` で呼び出せば `Bash(bash *)` にマッチして自動承認される。
+> **注意**: SSH/rsync コマンドは `settings.local.json` に `Bash(ssh *)` 等を含めれば直接実行可能。
+> ただし、ビルド・デプロイ・サーバー管理にはラッパースクリプト (`scripts/rdma-*.sh`) を推奨
+> （エラーハンドリング・ログ管理が組み込まれているため）。
+> 別ワークツリーから呼ぶ場合は絶対パスを使う: `bash /path/to/worktree/scripts/rdma-build.sh local`
 
 ### 1号機 (192.168.100.1) でビルド
 
@@ -448,7 +451,7 @@ CLAUDE.md のルールセクション（マルチラインコマンド、リダ�
 ### その他の知見
 
 - ユーザーがコマンド承認すると、プロジェクト設定に完全一致エントリが自動追加される
-- **SSH/rsync/scp は自動承認が効かない** → ラッパースクリプト (`bash scripts/rdma-*.sh`) で回避
+- **SSH/rsync/scp**: `Bash(ssh *)` 等をプロジェクト `settings.local.json` に含めれば自動承認される。以前「ハードコード制限」と誤認していたが、実際にはプロジェクト設定がグローバル設定を置換し、SSH パターンが欠落していたことが原因だった
 - **`git -C` を使わない理由**: `Bash(git -C *)` は push 等の破壊的コマンドも許可してしまうため安全でない
 - `echo`, `true`, `date`, `hostname`, `which` 等はビルトイン安全コマンドとして設定不要で自動承認
 
