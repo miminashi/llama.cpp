@@ -59,6 +59,7 @@ gpu-lock.sh wait [--timeout N] <command...>  # ロック待ち→実行
 gpu-lock.sh run llama-bench -m model.gguf -ngl 999 ...
 gpu-lock.sh run bash scripts/rdma-server.sh restart
 gpu-lock.sh wait --timeout 300 llama-bench ...
+gpu-lock.sh run GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 llama-bench -m model.gguf
 ```
 
 **誤った例（禁止）**:
@@ -125,7 +126,12 @@ Step 1 (完了) → Step 2 (完了) → Step 3 (完了) → Step 4 (完了) → 
 
 ### モデル分割方式
 
-- **レイヤー分割 (`-sm layer`) のみ** — P100にはNVLinkがなく、row splitでは性能が出ないことがシングルノード実験で確認済み
+- **レイヤー分割 (`-sm layer`) のみ** — P100 (NVLink なし) では row split は全条件で layer split に劣る
+- 1号機 (P100×7) でのベンチマーク実測値 (gpt-oss-20b Q4_K_M):
+  - 2 GPU: layer が row 比 pp512 +17%, tg +14% 優位
+  - 7 GPU: layer が row 比 pp512 +64%, tg +51% 優位
+  - row split は GPU 数増加で性能が劣化 (負のスケーリング)、layer split は 99% 維持
+- 詳細: [report/2026-02-19_163700_row_vs_layer_split_benchmark.md](report/2026-02-19_163700_row_vs_layer_split_benchmark.md)
 - RDMAバックエンドは既にレイヤー分割のみで動作している (各バックエンドインスタンス = 1リモートGPU)
 - row split の実装は不要
 
