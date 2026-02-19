@@ -27,8 +27,20 @@ clear_info() {
     rm -f "$INFO_FILE"
 }
 
+detect_gpu_procs() {
+    pgrep -a 'llama-bench|llama-cli|llama-server|rdma-server' 2>/dev/null || true
+}
+
 cmd_status() {
     if [ ! -f "$LOCK_FILE" ]; then
+        local gpu_procs
+        gpu_procs=$(detect_gpu_procs)
+        if [ -n "$gpu_procs" ]; then
+            echo "GPU_UNLOCKED_BUT_ACTIVE"
+            echo "Warning: GPU process detected without lock:" >&2
+            echo "$gpu_procs" >&2
+            return 0
+        fi
         echo "GPU_UNLOCKED"
         return 0
     fi
@@ -37,6 +49,14 @@ cmd_status() {
         flock -u 9
         exec 9<&-
         rm -f "$INFO_FILE"
+        local gpu_procs
+        gpu_procs=$(detect_gpu_procs)
+        if [ -n "$gpu_procs" ]; then
+            echo "GPU_UNLOCKED_BUT_ACTIVE"
+            echo "Warning: GPU process detected without lock:" >&2
+            echo "$gpu_procs" >&2
+            return 0
+        fi
         echo "GPU_UNLOCKED"
         return 0
     fi
@@ -66,6 +86,13 @@ cmd_run() {
         return 1
     fi
     trap 'clear_info; flock -u 9; exec 9<&-' EXIT
+    local gpu_procs
+    gpu_procs=$(detect_gpu_procs)
+    if [ -n "$gpu_procs" ]; then
+        echo "Warning: GPU process running without lock:" >&2
+        echo "$gpu_procs" >&2
+        echo "Proceeding anyway (lock acquired)." >&2
+    fi
     write_info "$@"
     "$@"
 }
@@ -99,6 +126,13 @@ cmd_wait() {
         flock 9
     fi
     trap 'clear_info; flock -u 9; exec 9<&-' EXIT
+    local gpu_procs
+    gpu_procs=$(detect_gpu_procs)
+    if [ -n "$gpu_procs" ]; then
+        echo "Warning: GPU process running without lock:" >&2
+        echo "$gpu_procs" >&2
+        echo "Proceeding anyway (lock acquired)." >&2
+    fi
     write_info "$@"
     "$@"
 }

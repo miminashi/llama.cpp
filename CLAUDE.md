@@ -50,15 +50,33 @@ gpu-lock.sh run <command...>                 # 即座に実行 (ロック中な�
 gpu-lock.sh wait [--timeout N] <command...>  # ロック待ち→実行
 ```
 
+> **重要**: `llama-bench`, `llama-cli` 等の GPU コマンドは**絶対に直接実行しないこと**。
+> 必ず `gpu-lock.sh run` または `gpu-lock.sh wait` で包んで実行する。
+> 直接実行すると他セッションのテストと競合し、両方の結果が信頼できなくなる。
+
+**正しい例**:
+```bash
+gpu-lock.sh run llama-bench -m model.gguf -ngl 999 ...
+gpu-lock.sh run bash scripts/rdma-server.sh restart
+gpu-lock.sh wait --timeout 300 llama-bench ...
+```
+
+**誤った例（禁止）**:
+```bash
+llama-bench -m model.gguf -ngl 999 ...          # ← gpu-lock なし
+build/bin/llama-cli -m model.gguf ...            # ← gpu-lock なし
+GGML_RDMA_SERVERS=... llama-bench ...            # ← 環境変数付きでも同様
+```
+
 #### ロック必須の操作
 
-| カテゴリ | 操作 | 理由 |
-|---------|------|------|
-| **GPU 推論** | `llama-bench`, `llama-cli`, その他 GPU を使う CUDA プログラム | GPU リソース競合 |
-| **サーバー管理** | `rdma-server.sh stop`, `rdma-server.sh restart` | 実行中クライアントの RDMA 接続が切断される |
-| **デプロイ** | `rdma-deploy.sh` | 2号機のビルドディレクトリ削除・再構築。テスト中に実行すると整合性が崩れる |
-| **カーネルモジュール** | `modprobe nvidia-peermem`, `rmmod nvidia-peermem` | GDR モジュール操作は実行中の RDMA 転送をクラッシュさせる |
-| **GPU 設定変更** | `nvidia-smi -pl`, `nvidia-smi -ac`, persistence mode 変更 | ベンチマーク計測値に影響 |
+| カテゴリ | 実行方法 | 理由 |
+|---------|---------|------|
+| **GPU 推論** | `gpu-lock.sh run llama-bench ...` / `gpu-lock.sh run llama-cli ...` | GPU リソース競合 |
+| **サーバー管理** | `gpu-lock.sh run bash scripts/rdma-server.sh stop` | 実行中クライアントの RDMA 接続が切断される |
+| **デプロイ** | `gpu-lock.sh run bash scripts/rdma-deploy.sh` | 2号機のビルドディレクトリ削除・再構築。テスト中に実行すると整合性が崩れる |
+| **カーネルモジュール** | `gpu-lock.sh run sudo modprobe nvidia-peermem` | GDR モジュール操作は実行中の RDMA 転送をクラッシュさせる |
+| **GPU 設定変更** | `gpu-lock.sh run nvidia-smi -pl 250` | ベンチマーク計測値に影響 |
 
 #### ロック不要の操作
 
