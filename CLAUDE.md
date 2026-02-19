@@ -27,7 +27,7 @@
 - **別ワークツリーでのコマンド実行**: `cd /path/to/worktree && bash scripts/...` パターンは使わない（`cd` は非ビルトインのため `&&` チェインが自動承認されない）。代わりに**絶対パス**でスクリプトやバイナリを呼ぶ: `bash /absolute/path/to/worktree/scripts/rdma-build.sh local`。`rdma-*.sh` スクリプトは `$(dirname "$0")` でパス解決するため任意のディレクトリから呼べる。バイナリ実行も絶対パスを使う: `/absolute/path/to/worktree/build/bin/llama-cli ...`
 - **ツールのパスに `~` を使わない**: Read, Glob, Grep 等のツールは `~` をシェル展開しない。`~/projects/...` ではなく `/home/ubuntu/projects/...` のように絶対パスを使うこと
 - **ワークツリー**: 改善策を実装する際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する。実装が完了したらワークツリー上でコミットするが、`feature/rdma-backend` へのマージは行わないこと（マージはユーザーが判断する）
-- **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/report/` に作成する
+- **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/report/` に作成する
 
 ## マルチセッション ワークフロー
 
