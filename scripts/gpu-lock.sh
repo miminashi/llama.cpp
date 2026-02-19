@@ -16,6 +16,18 @@ usage() {
     exit 1
 }
 
+exec_with_env() {
+    while [ $# -gt 0 ] && [[ "$1" == *=* ]] && [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+        export "$1"
+        shift
+    done
+    if [ $# -eq 0 ]; then
+        echo "Error: no command specified (only env vars found)" >&2
+        usage
+    fi
+    "$@"
+}
+
 write_info() {
     local cmd_str="$*"
     echo "pid=$$" > "$INFO_FILE"
@@ -94,7 +106,7 @@ cmd_run() {
         echo "Proceeding anyway (lock acquired)." >&2
     fi
     write_info "$@"
-    "$@"
+    exec_with_env "$@"
 }
 
 cmd_wait() {
@@ -134,7 +146,7 @@ cmd_wait() {
         echo "Proceeding anyway (lock acquired)." >&2
     fi
     write_info "$@"
-    "$@"
+    exec_with_env "$@"
 }
 
 case "${1:-}" in
