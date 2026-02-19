@@ -418,6 +418,8 @@ bash scripts/rdma-server.sh attach    # 実行中プロセスにアタッチ
 - 各ステップで `llama-bench` または `llama-cli` によるベンチマーク実行
 - レポートは `report/` ディレクトリに `REPORT.md` のフォーマットに従って記録
 - 性能数値は Prompt t/s と Generation t/s の両方を計測
+- 実験前に `bash scripts/rdma-env-check.sh` を実行し、警告がないことを確認する
+- レポート作成時は `bash scripts/rdma-env-check.sh --markdown` の出力を含める
 
 ### 11GPU クラスタテストの必須ルール
 
