@@ -21,6 +21,46 @@
 - **ワークツリー**: 修正作業を行う際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する
 - **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/.worktree/rdma-backend/report/` に作成する
 
+## マルチセッション ワークフロー
+
+### タスクボード
+
+タスク管理: `bash scripts/task-board.sh <command>`
+
+```bash
+task-board.sh list                           # 全タスク一覧
+task-board.sh add "タスク名" [ワークツリー名]  # 新規タスク追加 (state=impl)
+task-board.sh test <ID> [メモ]               # impl → test に遷移
+task-board.sh done <ID> [結果メモ]            # test → done に遷移
+task-board.sh delete <ID>                    # タスク削除
+task-board.sh show <ID>                      # タスク詳細表示
+```
+
+状態遷移: `impl`(実装中) → `test`(実験待ち) → `done`(完了)
+
+タスクデータは `/tmp/rdma-workflow/tasks.yaml` に保存。更新操作のたびに `TASK.md` が自動生成される。
+
+### GPU ロック
+
+GPU を使用するコマンド（llama-bench, llama-cli 等）は排他制御を通して実行すること:
+
+```bash
+gpu-lock.sh status                           # ロック状態確認
+gpu-lock.sh run <command...>                 # 即座に実行 (ロック中ならエラー)
+gpu-lock.sh wait [--timeout N] <command...>  # ロック待ち→実行
+```
+
+- GPU がロック中なら別タスクの実装を継続すること
+- バックグラウンド実行パターン: `Bash(run_in_background=true)` + `gpu-lock.sh wait` で GPU 待ちの間に別作業を進められる
+
+### セッションの進め方
+
+1. `task-board.sh list` でタスク一覧確認
+2. タスクを選んで実装開始
+3. 実装完了 → `task-board.sh test <ID>`
+4. GPU 空き確認 → `gpu-lock.sh run <test-command>`
+5. 実験完了 → `task-board.sh done <ID> "結果"`
+
 ## プロジェクト目標と現在の状況
 
 最終目標: GPUDirect RDMAを有効化し、2ノード16台のP100でGLM4.7 Q4を動作させること。

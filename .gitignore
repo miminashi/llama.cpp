@@ -141,3 +141,6 @@ a.out.*
 
 # Git worktrees
 /.worktree/
+
+# Task board (auto-generated)
+/TASK.md
