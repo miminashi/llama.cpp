@@ -42,13 +42,33 @@ task-board.sh show <ID>                      # タスク詳細表示
 
 ### GPU ロック
 
-GPU を使用するコマンド（llama-bench, llama-cli 等）は排他制御を通して実行すること:
+GPU やリモートノードの状態に影響する操作は排他制御を通して実行すること:
 
 ```bash
 gpu-lock.sh status                           # ロック状態確認
 gpu-lock.sh run <command...>                 # 即座に実行 (ロック中ならエラー)
 gpu-lock.sh wait [--timeout N] <command...>  # ロック待ち→実行
 ```
+
+#### ロック必須の操作
+
+| カテゴリ | 操作 | 理由 |
+|---------|------|------|
+| **GPU 推論** | `llama-bench`, `llama-cli`, その他 GPU を使う CUDA プログラム | GPU リソース競合 |
+| **サーバー管理** | `rdma-server.sh stop`, `rdma-server.sh restart` | 実行中クライアントの RDMA 接続が切断される |
+| **デプロイ** | `rdma-deploy.sh` | 2号機のビルドディレクトリ削除・再構築。テスト中に実行すると整合性が崩れる |
+| **カーネルモジュール** | `modprobe nvidia-peermem`, `rmmod nvidia-peermem` | GDR モジュール操作は実行中の RDMA 転送をクラッシュさせる |
+| **GPU 設定変更** | `nvidia-smi -pl`, `nvidia-smi -ac`, persistence mode 変更 | ベンチマーク計測値に影響 |
+
+#### ロック不要の操作
+
+| 操作 | 理由 |
+|------|------|
+| `nvidia-smi`（引数なし / 読み取りクエリ） | 状態確認のみ |
+| `rdma-server.sh status`, `rdma-server.sh log` | 読み取り専用 |
+| `rdma-server.sh start`（新規起動） | 既存プロセスに影響しない |
+| `rdma-build.sh local` | 1号機ビルドのみ、GPU 不使用 |
+| `rdma-env-check.sh` | 読み取り専用の環境チェック |
 
 - GPU がロック中なら別タスクの実装を継続すること
 - バックグラウンド実行パターン: `Bash(run_in_background=true)` + `gpu-lock.sh wait` で GPU 待ちの間に別作業を進められる
@@ -166,9 +186,15 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 | 要件 | 現環境 | 備考 |
 |------|--------|------|
 | NVIDIA Driver R470+ | 535.288.01 | `nvidia-peermem` モジュール同梱 |
-| MLNX_OFED | 24.10-1.1.4.0 | InfiniBand/RoCE ドライバ |
+| MLNX_OFED | 24.10-1.1.4.0 | InfiniBand/RoCE ドライバ。**カーネルモジュールは 6.8.0-90-generic 向けプリコンパイル** — カーネル更新時は再インストール要 |
 | ConnectX-4+ RNIC | mlx5_0 (CX-4) | FW 12.21.1000 |
 | Compute Capability 3.5+ | P100 (6.0) | GPUDirect RDMA の最低要件 |
+| カーネルバージョン | **6.8.0-90-generic** (固定) | GRUB で固定済み。変更禁止 (下記参照) |
+
+> **カーネルバージョン固定 (重要)**: MLNX_OFED カーネルモジュールは `6.8.0-90-generic` 向けプリコンパイルのため、カーネルが変わると `nvidia-peermem` がロードできなくなり GDR が動作しない。2026-02-10 に `unattended-upgrade` がカーネルを `6.8.0-100` に自動更新し、2026-02-12 の再起動後に GDR が壊れた。対策:
+> - 両ノードの GRUB を `6.8.0-90-generic` に固定済み
+> - `unattended-upgrade` のカーネル blacklist を設定済み (`/etc/apt/apt.conf.d/50unattended-upgrades`)
+> - **`apt upgrade` や `unattended-upgrade` でカーネルを更新しないこと**。更新する場合は MLNX_OFED の再インストール (`mlnxofedinstall --add-kernel-support`) が必要
 
 ### カーネルモジュール: `nvidia-peermem`
 
@@ -214,6 +240,10 @@ ssh 192.168.100.2 "lsmod | grep nvidia_peermem"
 | RDMA バックエンドログに `nvidia-peermem module not loaded` | サーバー側でモジュール未ロード | 2号機でも `modprobe` 実行 |
 | `ibv_reg_mr` 失敗 (GPU アドレス) | peermem 未ロード or ドライバ不整合 | `modinfo nvidia-peermem` でバージョンが `nvidia-smi` と一致するか確認 |
 | RDMA Write タイムアウト (大モデル) | ConnectX-4 MTT キャッシュ溢れ | `GGML_RDMA_GDR_BUDGET_GB=12` (デフォルト) で制限 |
+| `modprobe nvidia-peermem` → `Unknown symbol ib_register_peer_memory_client` | MLNX_OFED カーネルモジュールが現カーネル向けにビルドされていない。inbox `ib_uverbs` には peer memory API がない | MLNX_OFED を現カーネル向けに再インストール (`mlnxofedinstall --add-kernel-support`)、または MLNX_OFED モジュールがビルドされたカーネルで起動 |
+| `modules-load.d` に設定済みだが起動後に未ロード | `systemd-modules-load` が nvidia/ib_uverbs ドライバより先に実行される | 起動後に `lsmod \| grep nvidia_peermem` で確認。未ロードなら手動で `sudo modprobe nvidia-peermem` |
+
+> **注意**: カーネルアップデート後は必ず `lsmod | grep nvidia_peermem` で GDR モジュールが実際にロードされているか確認すること。MLNX_OFED カーネルモジュールは DKMS ではなくプリコンパイルバイナリのため、カーネルバージョンが変わると自動再ビルドされない。`nvidia-peermem` 自体は NVIDIA DKMS により再ビルドされるが、依存先の `ib_uverbs` (MLNX_OFED 版) が不在だとシンボル解決に失敗する。
 
 ### RDMA バックエンドでの GDR 設定
 
