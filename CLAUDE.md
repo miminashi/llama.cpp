@@ -144,7 +144,9 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 #### 達成済み
 - **GLM-4.7 IQ2_M が 11GPU (7C+4R) で安定動作** — 正常な推論出力を確認
 - **GPUDirect RDMA タイムアウト解消** — GDR バジェットシステム (`GGML_RDMA_GDR_BUDGET_GB`) で RNIC MTT キャッシュオーバーフローを回避
-- **Multi-RDMA デバイス出力破損修正** — `cpy_tensor` 無効化で `get_tensor+set_tensor` フォールバック
+- **Multi-RDMA デバイス出力破損修正** — deferred copy によるサーバーローカル D2H+H2D コピーに改善 (`cpy_tensor` 再有効化済み)
+- **Deferred copy 実装** — `cpy_tensor` をサーバーローカル実行に変更し、IB ネットワークラウンドトリップを排除。GLM-4.7 で tg +1.45% 改善
+- **サーバー堅牢化** — マルチスレッド化により、クライアント切断後も再起動不要で次の接続を受付
 - **get_tensor stale data 修正** — per-buffer `mr_is_gdr` フラグで GDR MR のみ RDMA Read 許可
 - **mmap + RDMA Write 修正** — 4GB per-buffer サイズ制限 + Send/Recv フォールバック
 
@@ -159,6 +161,8 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 - RDMA は Prompt 処理で RPC 比 **+19%** (RDMA Write ゼロコピーの効果)
 - RPC は Generation で RDMA 比 **+10%** (デバイスごとの独立ソケットによるコマンド並列化)
 - GDR 有効で Generation が GDR 無効比 **+13%** 改善
+
+> **注記**: 上記数値は Step 5 初期検証時点 (deferred copy マージ前) の測定値。Deferred copy マージ後のベンチマークでは tg ≈ 7.65-7.76 t/s を記録しており、Generation での RPC 比劣位は縮小している可能性がある。
 
 #### 前提条件
 - Step 4 (GPUDirect RDMA) が動作していること ✅
@@ -184,17 +188,12 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 #### Generation 速度での RPC 比劣位
 - RDMA は単一接続で全リモートデバイスを共有するため、graph_compute が逐次実行される
 - RPC はデバイスごとに独立ソケットを持ち、コマンド送信を並列化可能
-- **改善案**: RDMA 接続のデバイス分離またはパイプライン化 (未実装)
+- **改善案**: RDMA 接続のデバイス分離またはパイプライン化 (per-device connections は実装済み `GGML_RDMA_PER_DEVICE_CONN=1`、ConnectX-4 では MTT キャッシュ制限によりデフォルト無効)
 
 #### サーバーGPU 計算時間のセッション間変動
 - RDMA (GDR 無効) の Generation 速度が 5.5-6.8 t/s と大きくばらつく
 - GPU のサーマルスロットリングまたは CUDA コンテキスト初期化の影響と推定
 - GDR 有効時は比較的安定 (6.6-6.9 t/s)
-
-#### クライアント異常切断後のサーバー復旧
-- クライアントがクラッシュした場合、サーバーの QP 状態が壊れることがある
-- 次のテスト実行前にサーバーの再起動が必要
-- シングルスレッドのサーバー設計に起因 (接続回復パスが未実装)
 
 #### GDR バジェットのデフォルト値
 - デフォルト 12GB は ConnectX-4 の MTT キャッシュ推定値 (~10-16GB) に基づく経験的な値
@@ -392,6 +391,9 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
 | `GGML_RDMA_TIMEOUT_MS` | RDMA 操作 (Send/Recv/Write/Read) のタイムアウト (ms) | 30000 |
 | `GGML_RDMA_COMPUTE_TIMEOUT_MS` | graph_compute 応答待ちのタイムアウト (ms) | 300000 |
 | `GGML_RDMA_ASYNC_COMPUTE` | `0` で graph_compute の fire-and-forget を無効化 (デバッグ用) | 未設定 (有効) |
+| `GGML_RDMA_NO_DEFERRED_COPY` | `1` で deferred copy を無効化 (`cpy_tensor` が常に false を返す) | 未設定 (有効) |
+| `GGML_RDMA_VERIFY_COPY` | `1` で deferred copy の検証モード有効化 (デバッグ用) | 未設定 |
+| `GGML_RDMA_PER_DEVICE_CONN` | `1` でデバイスごとに独立した RDMA 接続を使用 (ConnectX-6+ 向け) | 未設定 (共有接続) |
 
 ### よくあるエラーと対処法
 
