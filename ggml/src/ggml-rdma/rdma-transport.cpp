@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 static const char * RDMA_DEBUG = std::getenv("GGML_RDMA_DEBUG");
+static const bool RDMA_NO_SELECTIVE_SIGNAL = !!std::getenv("GGML_RDMA_NO_SELECTIVE_SIGNAL");
 
 static int get_rdma_timeout_ms() {
     const char * env = std::getenv("GGML_RDMA_TIMEOUT_MS");
@@ -396,6 +397,9 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
     size_t remaining = size;
     const size_t chunk_size = send_buffer_.size(); // Use internal buffer size as max chunk
 
+    static constexpr size_t RDMA_SIGNAL_INTERVAL = 64;
+    size_t unsignaled_count = 0;
+
     while (remaining > 0) {
         size_t send_size = remaining;
 
@@ -438,17 +442,23 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
         }
 
         wr.opcode = IBV_WR_SEND;
-        wr.send_flags |= IBV_SEND_SIGNALED;
+        bool is_last = (remaining == send_size);
+        bool do_signal = RDMA_NO_SELECTIVE_SIGNAL || is_last || (++unsignaled_count >= RDMA_SIGNAL_INTERVAL);
+        if (do_signal) {
+            wr.send_flags |= IBV_SEND_SIGNALED;
+        }
 
         if (ibv_post_send(qp_, &wr, &bad_wr) != 0) {
             GGML_LOG_ERROR("[rdma_connection] Failed to post send: %s\n", strerror(errno));
             return false;
         }
 
-        // Wait for completion
-        if (!wait_for_completion(RDMA_TIMEOUT_MS)) {
-            GGML_LOG_ERROR("[rdma_connection] Send completion timeout\n");
-            return false;
+        if (do_signal) {
+            if (!wait_for_completion(RDMA_TIMEOUT_MS)) {
+                GGML_LOG_ERROR("[rdma_connection] Send completion timeout\n");
+                return false;
+            }
+            unsignaled_count = 0;
         }
 
         stats_.bytes_sent += send_size;

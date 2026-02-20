@@ -35,6 +35,7 @@ static bool get_rdma_async_compute() {
     return true; // default enabled
 }
 static const bool RDMA_ASYNC_COMPUTE = get_rdma_async_compute();
+static const bool RDMA_NO_SELECTIVE_SIGNAL = !!std::getenv("GGML_RDMA_NO_SELECTIVE_SIGNAL");
 
 static int get_rdma_compute_timeout_ms() {
     const char * env = std::getenv("GGML_RDMA_COMPUTE_TIMEOUT_MS");
@@ -982,6 +983,9 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             // Lock op_mutex_ for the entire chunked transfer
             std::lock_guard<std::recursive_mutex> op_lock(ctx->conn->op_mutex_);
 
+            static constexpr size_t RDMA_SIGNAL_INTERVAL = 64;
+            size_t unsignaled_count = 0;
+
             while (remaining > 0) {
                 size_t chunk = std::min(remaining, RDMA_WRITE_CHUNK_SIZE);
 
@@ -998,11 +1002,17 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 remote.rkey = ctx->mr_rkey;
                 remote.size = chunk;
 
-                RDMA_LOG_DBG("[rdma_set_tensor] RDMA write: remote.addr=0x%lx, buf_offset=%lu, chunk=%zu/%zu\n",
-                             (unsigned long)remote.addr, (unsigned long)cur_buf_offset, chunk, size);
-                if (!ctx->conn->rdma_write(buf, chunk, mr, remote, true)) {
+                bool is_last = (remaining == chunk);
+                bool do_signal = RDMA_NO_SELECTIVE_SIGNAL || is_last || (++unsignaled_count >= RDMA_SIGNAL_INTERVAL);
+
+                RDMA_LOG_DBG("[rdma_set_tensor] RDMA write: remote.addr=0x%lx, buf_offset=%lu, chunk=%zu/%zu, signaled=%d\n",
+                             (unsigned long)remote.addr, (unsigned long)cur_buf_offset, chunk, size, (int)do_signal);
+                if (!ctx->conn->rdma_write(buf, chunk, mr, remote, do_signal)) {
                     write_ok = false;
                     break;
+                }
+                if (do_signal) {
+                    unsignaled_count = 0;
                 }
 
                 src += chunk;
