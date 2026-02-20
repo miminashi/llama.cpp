@@ -169,6 +169,20 @@ GPU 合計: ~96 GiB + Host: ~18 GiB = ~114 GiB (モデル全体)
 
 Layer split が全条件で優位。これは NVLink なし環境での既知の制限 ([参照レポート](2026-02-19_163700_row_vs_layer_split_benchmark.md))。
 
+## 11GPU RDMA ベンチマーク結果
+
+11GPU (7 CUDA + 4 RDMA) での row split vs layer split 比較を別レポートに記録:
+[report/2026-02-19_193000_row_split_11gpu_rdma_benchmark.md](2026-02-19_193000_row_split_11gpu_rdma_benchmark.md)
+
+| 分割方式 | pp128 (t/s) | pp512 (t/s) | tg32 (t/s) |
+|---------|:-----------:|:-----------:|:----------:|
+| layer split | 23.70 ± 0.40 | 39.02 ± 0.31 | 7.70 ± 0.03 |
+| row split | 21.75 ± 0.23 | 28.23 ± 0.07 | 6.70 ± 0.00 |
+| **差分** | **-8.2%** | **-27.7%** | **-13.0%** |
+
+11GPU 構成でも layer split が全条件で優位。ただし 7GPU ローカル (-39%/-34%) と比べて差は縮小。
+RDMA バックエンドの `split_buffer_type` 未対応により、リモートデバイスは実質 layer split フォールバックとなるため。
+
 ## 制約事項
 
 1. **llama-bench では効果なし**: `llama_params_fit` を使わないため、`-ngl 999` でモデルが VRAM に収まらない場合は引き続き失敗する
