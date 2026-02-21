@@ -13,7 +13,7 @@ user-invocable: true
 GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 \
   build/bin/llama-bench \
   -m /home/ubuntu/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  -ngl 999 -sm layer -r 1 -p 128 -n 32
+  -ngl 999 -sm layer -fa 1 -r 1 -p 128 -n 32
 ```
 
 **gpt-oss-20b 2GPU (CUDA0 + RDMA0)**
@@ -21,7 +21,7 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 \
 GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 \
   build/bin/llama-bench \
   -m /home/ubuntu/models/gpt-oss-20b-Q4_K_M.gguf \
-  -ngl 999 -sm layer -r 1 -p 128 -n 32
+  -ngl 999 -sm layer -fa 1 -r 1 -p 128 -n 32
 ```
 
 ### マルチファイルGGUFの使用
@@ -46,7 +46,7 @@ ln -sf /home/ubuntu/.cache/llama.cpp/unsloth_gpt-oss-120b-GGUF_Q4_K_M_gpt-oss-12
 ```bash
 llama-bench -m /tmp/gpt-oss-120b/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf \
   -dev 'CUDA0/CUDA1/CUDA2/CUDA3/CUDA4/CUDA5/CUDA6/RDMA0[192.168.100.2:50051]/RDMA1[192.168.100.2:50051]/RDMA2[192.168.100.2:50051]/RDMA3[192.168.100.2:50051]' \
-  -ngl 999 -sm layer -r 1 -p 128 -n 32
+  -ngl 999 -sm layer -fa 1 -r 1 -p 128 -n 32
 ```
 
 ## llama-cli 実行 (1号機, 11GPU クラスタ)
@@ -58,7 +58,7 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
   -hf unsloth/gpt-oss-120b-GGUF:Q4_K_M \
   -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
   -sm layer -ngl 999 -c 2048 -p 'こんにちは' -n 50 \
-  --no-warmup --single-turn --simple-io \
+  --flash-attn on --no-warmup --single-turn --simple-io \
   --log-file /tmp/llama-cli.log
 ```
 
@@ -117,9 +117,9 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 LD_LIBRARY_PATH=build/bin \
   -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
   -sm layer -ngl 999 -c 2048 -n 50 --seed 42 \
   -p 'The capital of France is' \
-  --no-warmup --single-turn --simple-io --log-file /tmp/llama-cli.log
+  --flash-attn on --no-warmup --single-turn --simple-io --log-file /tmp/llama-cli.log
 ```
 
-- 期待値: Prompt ≈ 6.4 t/s, Generation ≈ 6.8 t/s (GDR 有効時)
+- 期待値: Prompt ≈ 30.6 t/s, Generation ≈ 8.5 t/s (GDR 有効, flash attention 有効時)
 
 A/B 性能比較には ABAB Paired Design + 対応あり t 検定を使用。詳細: `/stats` スキル参照。
