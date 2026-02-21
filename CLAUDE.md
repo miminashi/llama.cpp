@@ -170,7 +170,7 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 - RPC は Generation で RDMA 比 **+10%** (デバイスごとの独立ソケットによるコマンド並列化)
 - GDR 有効で Generation が GDR 無効比 **+13%** 改善
 
-> **注記**: 上記数値は Step 5 初期検証時点 (deferred copy マージ前) の測定値。Deferred copy マージ後のベンチマークでは tg ≈ 7.65-7.76 t/s を記録しており、Generation での RPC 比劣位は縮小している可能性がある。
+> **注記**: 上記数値は Step 5 初期検証時点 (deferred copy マージ前) の測定値。最新のベンチマーク (selective signaling + flash attention 込み) では pp128 ≈ 30.6, tg32 ≈ 8.5 t/s を記録。Generation での RPC 比劣位は解消済み。
 
 #### 前提条件
 - Step 4 (GPUDirect RDMA) が動作していること ✅
@@ -232,6 +232,8 @@ Debug ビルドと gdb ヘルパーは `/debug-rdma` スキルを参照。
 - 実験前に `bash scripts/rdma-env-check.sh` を実行し、警告がないことを確認する
 - レポート作成時は `bash scripts/rdma-env-check.sh --markdown` の出力を含める
 - **最終テストには必ず GLM-4.7 (IQ2_M) を 11GPU (7C+4R) で実行すること**
+- **`-nkvo 1` を使用しないこと** — KV キャッシュが CPU に配置され、tg が -31% 劣化する。11GPU (176GB VRAM) では KV キャッシュも GPU に収まるため不要。詳細: [tg32 デグレ調査レポート](report/2026-02-21_210816_tg32_degression_investigation.md)
+- **`-fa 1` (flash attention) を推奨** — tg32 で +10% の改善効果あり
 
 コマンド例・11GPU テスト手順の詳細は `/bench` スキルを参照。
 A/B 性能比較には ABAB Paired Design + 対応あり t 検定を使用。詳細: `/stats` スキル参照。
