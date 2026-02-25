@@ -399,6 +399,7 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
 
     static constexpr size_t RDMA_SIGNAL_INTERVAL = 64;
     size_t unsignaled_count = 0;
+    bool uses_internal_buffer = false;
 
     while (remaining > 0) {
         size_t send_size = remaining;
@@ -406,6 +407,8 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
         struct ibv_sge sge = {};
         struct ibv_send_wr wr = {};
         struct ibv_send_wr * bad_wr = nullptr;
+
+        uses_internal_buffer = false;
 
         if (mr) {
             sge.addr = (uint64_t)src;
@@ -421,6 +424,7 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
             wr.num_sge = 1;
             wr.send_flags |= IBV_SEND_INLINE;
         } else if (chunk_size > 0 && send_mr_) {
+            uses_internal_buffer = true;
             // Use internal send buffer, chunk if needed
             if (send_size > chunk_size) {
                 send_size = chunk_size;
@@ -443,7 +447,12 @@ bool rdma_connection::send(const void * data, size_t size, struct ibv_mr * mr) {
 
         wr.opcode = IBV_WR_SEND;
         bool is_last = (remaining == send_size);
-        bool do_signal = RDMA_NO_SELECTIVE_SIGNAL || is_last || (++unsignaled_count >= RDMA_SIGNAL_INTERVAL);
+        // Always signal when using internal buffer: it's a single reusable
+        // allocation, so we must wait for DMA completion before the next
+        // iteration's memcpy overwrites it.
+        bool do_signal = RDMA_NO_SELECTIVE_SIGNAL || is_last
+                         || uses_internal_buffer
+                         || (++unsignaled_count >= RDMA_SIGNAL_INTERVAL);
         if (do_signal) {
             wr.send_flags |= IBV_SEND_SIGNALED;
         }

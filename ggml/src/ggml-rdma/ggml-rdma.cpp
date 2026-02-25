@@ -1002,8 +1002,8 @@ static void ggml_backend_rdma_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 // Always signal RDMA Write: the staging buffer is a single reusable
                 // allocation, so we must wait for each write's DMA to complete before
                 // the next iteration's memcpy overwrites it.
-                // Note: selective signaling for Send (rdma_connection::send) is safe
-                // because graph serialization data is always < 16MB (single chunk).
+                // Note: rdma_connection::send() has the same always-signal logic for
+                // its internal buffer (send_buffer_) to prevent the same race.
                 RDMA_LOG_DBG("[rdma_set_tensor] RDMA write: remote.addr=0x%lx, buf_offset=%lu, chunk=%zu/%zu\n",
                              (unsigned long)remote.addr, (unsigned long)cur_buf_offset, chunk, size);
                 if (!ctx->conn->rdma_write(buf, chunk, mr, remote, true)) {
