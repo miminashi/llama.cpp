@@ -287,8 +287,139 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
 | [WebGPU [In Progress]](docs/build.md#webgpu) | All |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
+| [RDMA](#rdma-バックエンド-マルチノード推論) | InfiniBand/RoCE + NVIDIA GPU |
 | [Hexagon [In Progress]](docs/backend/hexagon/README.md) | Snapdragon |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
+
+## RDMA バックエンド (マルチノード推論)
+
+RDMA (Remote Direct Memory Access) バックエンドにより、複数ノードの GPU を活用したマルチノード LLM 推論が可能です。GPUDirect RDMA にも対応しており、CPU を介さない GPU 間直接転送でプロンプト処理を高速化します。
+
+### 前提条件
+
+RDMA バックエンドを使用するには、InfiniBand/RoCE ネットワークで接続されたマルチノード環境が必要です。
+
+```sh
+# ローカルノードでビルド
+bash scripts/rdma-build.sh local
+
+# リモートノードへデプロイ (ビルド済みバイナリを転送)
+bash scripts/rdma-deploy.sh
+```
+
+### RDMA サーバーの起動
+
+リモートノードで RDMA サーバーを起動します。
+
+```sh
+# 推奨: スクリプトによる起動
+bash scripts/rdma-server.sh start
+
+# 状態確認
+bash scripts/rdma-server.sh status
+
+# 手動起動 (リモートノード上で直接実行する場合)
+LD_LIBRARY_PATH=./build/bin ./build/bin/rdma-server -H 0.0.0.0 -p 50051
+```
+
+### llama-cli の起動
+
+11GPU 構成 (ローカル 7 CUDA + リモート 4 RDMA) での例:
+
+```sh
+# 会話モード
+GGML_RDMA_SERVERS=192.168.100.2:50051 \
+  ./build/bin/llama-cli \
+  -m model.gguf \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -fa 1 \
+  --log-file /tmp/llama-cli.log
+
+# ワンショット実行 (非対話モード)
+GGML_RDMA_SERVERS=192.168.100.2:50051 \
+  ./build/bin/llama-cli \
+  -m model.gguf \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -fa 1 \
+  -p "Hello, world!" -n 128 \
+  --log-file /tmp/llama-cli.log
+```
+
+### llama-server の起動
+
+```sh
+GGML_RDMA_SERVERS=192.168.100.2:50051 \
+  ./build/bin/llama-server \
+  -m model.gguf \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -fa 1 \
+  --host 0.0.0.0 --port 8080
+```
+
+- WebUI: `http://<ホスト>:8080`
+- API エンドポイント: `http://<ホスト>:8080/v1/chat/completions`
+
+### 実行例: Qwen3.5-122B-A10B (MoE 122B)
+
+Qwen3.5-122B-A10B (Q4_K_M) を 11GPU クラスタ (7 CUDA + 4 RDMA) で実行する具体例です。
+
+#### モデルダウンロード
+
+```sh
+pip install huggingface_hub
+huggingface-cli download unsloth/Qwen3.5-122B-A10B-GGUF \
+  Qwen3.5-122B-A10B-Q4_K_M.gguf \
+  --local-dir ~/.cache/llama.cpp/
+```
+
+#### llama-cli (会話モード)
+
+```sh
+GGML_RDMA_SERVERS=192.168.100.2:50051 \
+  ./build/bin/llama-cli \
+  -m ~/.cache/llama.cpp/Qwen3.5-122B-A10B-Q4_K_M.gguf \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -fa 1 \
+  -cnv \
+  --log-file /tmp/llama-cli.log
+```
+
+#### llama-server (API サーバー)
+
+```sh
+GGML_RDMA_SERVERS=192.168.100.2:50051 \
+  ./build/bin/llama-server \
+  -m ~/.cache/llama.cpp/Qwen3.5-122B-A10B-Q4_K_M.gguf \
+  -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
+  -sm layer -ngl 999 -fa 1 \
+  --host 0.0.0.0 --port 8080
+```
+
+#### 実測性能
+
+| 構成 | Prompt (t/s) | Generation (t/s) |
+| --- | ---: | ---: |
+| P100 × 11 (7C+4R), RDMA + GDR | 18.0 | 15.6 |
+
+### 主要な環境変数
+
+| 環境変数 | デフォルト | 説明 |
+| --- | --- | --- |
+| `GGML_RDMA_SERVERS` | (なし) | RDMA サーバーのエンドポイント (カンマ区切り、`host:port` 形式) |
+| `GGML_RDMA_GDR_BUDGET_GB` | `12` | GPUDirect RDMA に使用する VRAM バジェット (GB) |
+| `GGML_RDMA_NO_GDR` | `0` | `1` で GPUDirect RDMA を無効化 |
+| `GGML_RDMA_NO_SELECTIVE_SIGNAL` | `0` | `1` で選択的シグナリングを無効化 |
+| `GGML_RDMA_PER_DEVICE_CONN` | `0` | `1` でデバイスごとの RDMA 接続を有効化 |
+| `GGML_RDMA_PARALLEL_DISPATCH` | `1` | `0` でエキスパート並列ディスパッチを無効化 |
+| `GGML_RDMA_DEBUG` | `0` | `1` でデバッグ出力を有効化 |
+
+### 注意事項
+
+- **`-nkvo 1` を使用しないこと** — KV キャッシュが CPU に配置され、Generation 速度が約 31% 低下します
+- **`-fa 1` (Flash Attention) を推奨** — Generation 速度が約 10% 向上します
+- **`-sm layer` のみ使用** — RDMA バックエンドはレイヤー分割のみをサポートします
+- `-dev` フラグのデバイス名は `RDMA<番号>[ホスト:ポート]` の形式で指定します (例: `RDMA0[192.168.100.2:50051]`)
+- `GGML_RDMA_SERVERS` 環境変数と `-dev` フラグの両方が必要です
 
 ## Obtaining and quantizing models
 
