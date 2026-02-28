@@ -304,6 +304,9 @@ int main(int argc, char ** argv) {
                 another_line = console::readline(line, params.multiline_input);
                 buffer += line;
             } while (another_line);
+            if (!another_line && buffer.empty()) {
+                break;  // stdin EOF
+            }
         } else {
             // process input prompt from args
             for (auto & fname : params.image) {
