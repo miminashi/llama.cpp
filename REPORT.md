@@ -12,11 +12,14 @@
 - 実験に際して参照した過去のレポートがある場合は、そのレポートへのリンクを記載する
 - 作業に使用したワークツリー名を記載する（例: `.worktree/rdma-backend`）
 - 実験レポートには `bash scripts/rdma-env-check.sh --markdown` の出力を「環境情報」セクションとして記載する
+- レポートに埋め込む画像は `report/image/` ディレクトリに配置する
 
 ### 例
 
 ```
 report/
+  image/
+    2026-01-30_distributed_inference_chart.png
   2026-01-30_143052_distributed_inference_report.md
 ```
 

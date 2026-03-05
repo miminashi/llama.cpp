@@ -23,9 +23,11 @@
 - **ファイルへのリダイレクトを使わない**: `2>/tmp/file.log` や `>/tmp/file.log` 等のファイルリダイレクトはパーミッション自動承認が効かない（`2>/dev/null` と `2>&1` のみ許可）。stderr をファイルに保存したい場合は、Bash ツールの出力を直接利用すること
 - **パーミッション設定の優先順位**: プロジェクト `settings.local.json` に `permissions.allow` がある場合、グローバル `settings.local.json` の `permissions.allow` は置換される（マージされない）。プロジェクト設定には必要なグローバルパターンも含めること。ワークツリーの場合、メインリポジトリの `.claude/settings.local.json` が読まれるため、設定変更はメインリポジトリ側で行うこと
 - **SSH コマンド**: `ssh`, `rsync`, `scp` は `settings.local.json` に `Bash(ssh *)` 等を含めれば自動承認される。ただし、2号機でのビルド・デプロイ・サーバー管理には `scripts/rdma-*.sh` ラッパースクリプトを推奨（エラーハンドリング・ログ管理が組み込まれているため）
-- **`git -C` を使わない**: `Bash(git -C *)` は push 等の破壊的コマンドも許可するため安全でない。代替手段: (1) 対象ディレクトリに `cd` してから `git` を実行 (`cd /path && git status`)、(2) 現在のワークツリーで作業中なら `-C` は不要
+- **`git -C` の使用制限**: ワークツリー内の **read-only 操作** (`log`, `status`, `diff`, `show`, `rev-parse`, `branch`) は `git -C` を使用してよい（`settings.local.json` にパターン登録済み）。**書き込み操作** (`push`, `reset`, `checkout --`, `clean`, `cherry-pick`) には `git -C` を使わないこと — `Bash(git -C *)` のワイルドカード許可は破壊的コマンドも通すため安全でない
 - **別ワークツリーでのコマンド実行**: `cd /path/to/worktree && bash scripts/...` パターンは使わない（`cd` は非ビルトインのため `&&` チェインが自動承認されない）。代わりに**絶対パス**でスクリプトやバイナリを呼ぶ: `bash /absolute/path/to/worktree/scripts/rdma-build.sh local`。`rdma-*.sh` スクリプトは `$(dirname "$0")` でパス解決するため任意のディレクトリから呼べる。バイナリ実行も絶対パスを使う: `/absolute/path/to/worktree/build/bin/llama-cli ...`
 - **ツールのパスに `~` を使わない**: Read, Glob, Grep 等のツールは `~` をシェル展開しない。`~/projects/...` ではなく `/home/ubuntu/projects/...` のように絶対パスを使うこと
+- **`$(...)` コマンド置換を使わない**: `$()` を含むコマンドは自動承認されない。`-j$(nproc)` → 先に `nproc` で値を確認し `-j16` のようにリテラル指定する
+- **パイプで `head`/`tail`/`cat` を使わない**: これらは専用ツール強制のハードコード制限で Bash 自動承認不可。ビルド出力のフィルタリングが不要ならパイプなしで実行する。出力が長い場合は Bash ツールがキャプチャした出力を確認する。代替パターン: `git log | head -N` → `git log -N`、`git log | wc -l` → `git rev-list --count`、`/proc` ファイル読み取り → `Read` ツールまたは `strings`/`tr` 単体コマンド
 - **ワークツリー**: 改善策を実装する際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する。実装が完了したらワークツリー上でコミットするが、`feature/rdma-backend` へのマージは行わないこと（マージはユーザーが判断する）
 - **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/report/` に作成する
 
@@ -170,7 +172,7 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 - RPC は Generation で RDMA 比 **+10%** (デバイスごとの独立ソケットによるコマンド並列化)
 - GDR 有効で Generation が GDR 無効比 **+13%** 改善
 
-> **注記**: 上記数値は Step 5 初期検証時点 (deferred copy マージ前) の測定値。最新のベンチマーク (selective signaling + flash attention 込み) では pp128 ≈ 30.6, tg32 ≈ 8.5 t/s を記録。Generation での RPC 比劣位は解消済み。
+> **注記**: 上記数値は Step 5 初期検証時点の測定値。flash attention (`-fa 1`) 込みの最新ベースラインは pp128 ≈ 24.3, tg32 ≈ 8.5 t/s。バッファ再利用レースコンディション修正 (Send always-signal) により selective signaling が実質無効化され pp128 は ≈30.6 → ≈24.3。回復策 (Send double-buffering) は未実装。
 
 #### 前提条件
 - Step 4 (GPUDirect RDMA) が動作していること ✅
@@ -180,35 +182,9 @@ GPUDirect RDMA + 2ノード16台P100で GLM4.7 Q4 を動作させる。
 - GLM4.7 Q4 が16台P100で推論完了できること
 - 実用的な推論速度が得られること (11GPU での IQ2_M 実績: pp=6.4, tg=6.8 t/s)
 
-### 残タスク
+### 課題管理
 
-1. **16GPU への拡張** (GPU 追加後)
-   - 16GPU (8+8) への拡張と全 GPU での RDMA 接続確立テスト
-   - GLM-4.7 Q4 (IQ2_M より大きい量子化) がVRAMに収まるか検証
-   - `-sm layer` によるレイヤー分割で VRAM 分配計画を策定
-
-2. **GLM-4.7 Q4 量子化モデルの準備**
-   - unsloth GLM-4.7 Q4 のダウンロードとサイズ確認
-   - IQ2_M (~40GB) では11GPUで動作したが、Q4 はより大きいため16GPU が必要な可能性
-
-### 残課題・懸念事項
-
-#### Generation 速度での RPC 比劣位
-- RDMA は単一接続で全リモートデバイスを共有するため、graph_compute が逐次実行される
-- RPC はデバイスごとに独立ソケットを持ち、コマンド送信を並列化可能
-- **改善案**: RDMA 接続のデバイス分離またはパイプライン化 (per-device connections は実装済み `GGML_RDMA_PER_DEVICE_CONN=1`、ConnectX-4 では MTT キャッシュ制限によりデフォルト無効)
-
-#### サーバーGPU 計算時間のセッション間変動
-- RDMA (GDR 無効) の Generation 速度が 5.5-6.8 t/s と大きくばらつく
-- GPU のサーマルスロットリングまたは CUDA コンテキスト初期化の影響と推定
-- GDR 有効時は比較的安定 (6.6-6.9 t/s)
-
-#### GDR バジェットのデフォルト値
-- デフォルト 12GB は ConnectX-4 の MTT キャッシュ推定値 (~10-16GB) に基づく経験的な値
-- より大容量の RNIC (ConnectX-6 等) では `GGML_RDMA_GDR_BUDGET_GB` を増やすことで全デバイス GDR が可能
-- 現状では `GGML_RDMA_NO_GDR=1` も引き続き使用可能 (per-buffer フラグにフォールバック)
-
-GDR は `nvidia_peermem` モジュールがロードされていれば自動有効化。詳細: `/gdr` スキル参照。
+詳細は [ISSUES.md](ISSUES.md) を参照。
 
 ---
 
@@ -225,6 +201,14 @@ Debug ビルドと gdb ヘルパーは `/debug-rdma` スキルを参照。
 ---
 
 ## 検証方法
+
+> **暫定ルール**: 以下のルールはこのブロックが削除されるまで、下記の恒久ルールより優先される。
+>
+> - **テスト GPU 構成**: Node 1 CUDA4-5 + Node 2 RDMA0-1 (4GPU)
+>   - `CUDA_VISIBLE_DEVICES=4,5 GGML_RDMA_SERVERS=192.168.100.2:50051`
+>   - `-dev 'CUDA0,CUDA1,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051]'`
+> - **テストモデル**: `unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_M` (`-hf` フラグで指定)
+> - **参照**: [2プロセス構成レポート](report/2026-03-02_021500_dual_llama_server_setup.md)
 
 - 各ステップで `llama-bench` または `llama-cli` によるベンチマーク実行
 - レポートは `report/` ディレクトリに `REPORT.md` のフォーマットに従って記録
