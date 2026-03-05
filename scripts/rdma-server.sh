@@ -21,15 +21,27 @@ usage() {
 }
 
 server_start() {
-    echo "Starting rdma-server on $NODE2..."
-    ssh "$NODE2" "LD_LIBRARY_PATH=${PROJECT_DIR}/build/bin nohup ${PROJECT_DIR}/build/bin/rdma-server -H $HOST -p $PORT > /tmp/rdma-server.log 2>&1 &"
+    local cuda_vis_env=""
+    if [ -n "${RDMA_SERVER_DEVICES:-}" ]; then
+        local indices=""
+        IFS=',' read -ra devs <<< "${RDMA_SERVER_DEVICES}"
+        for dev in "${devs[@]}"; do
+            local idx="${dev#CUDA}"
+            if [ -n "$indices" ]; then indices="${indices},${idx}"; else indices="${idx}"; fi
+        done
+        cuda_vis_env="CUDA_VISIBLE_DEVICES=${indices}"
+        echo "Starting rdma-server on $NODE2 (${cuda_vis_env})..."
+    else
+        echo "Starting rdma-server on $NODE2 (all devices)..."
+    fi
+    ssh "$NODE2" "LD_LIBRARY_PATH=${PROJECT_DIR}/build/bin ${cuda_vis_env} nohup ${PROJECT_DIR}/build/bin/rdma-server -H $HOST -p $PORT > /tmp/rdma-server.log 2>&1 &"
     sleep 2
     server_status
 }
 
 server_stop() {
-    echo "Stopping rdma-server on $NODE2..."
-    ssh "$NODE2" "pkill -f rdma-server || true"
+    echo "Stopping rdma-server (port $PORT) on $NODE2..."
+    ssh "$NODE2" "pkill -f 'rdma-server.*-p ${PORT}' || true"
     sleep 1
     server_status
 }
@@ -53,9 +65,19 @@ server_log() {
 }
 
 server_debug() {
+    local cuda_vis_env=""
+    if [ -n "${RDMA_SERVER_DEVICES:-}" ]; then
+        local indices=""
+        IFS=',' read -ra devs <<< "${RDMA_SERVER_DEVICES}"
+        for dev in "${devs[@]}"; do
+            local idx="${dev#CUDA}"
+            if [ -n "$indices" ]; then indices="${indices},${idx}"; else indices="${idx}"; fi
+        done
+        cuda_vis_env="CUDA_VISIBLE_DEVICES=${indices}"
+    fi
     echo "Starting rdma-server under gdb on $NODE2 (foreground, interactive)..."
     echo "Note: this requires an interactive terminal (ssh -t)"
-    ssh -t "$NODE2" "LD_LIBRARY_PATH=${PROJECT_DIR}/build/bin gdb -x ${GDBINIT_REMOTE} --args ${PROJECT_DIR}/build/bin/rdma-server -H $HOST -p $PORT"
+    ssh -t "$NODE2" "${cuda_vis_env} LD_LIBRARY_PATH=${PROJECT_DIR}/build/bin gdb -x ${GDBINIT_REMOTE} --args ${PROJECT_DIR}/build/bin/rdma-server -H $HOST -p $PORT"
 }
 
 server_attach() {
