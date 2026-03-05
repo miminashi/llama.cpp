@@ -411,6 +411,8 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
 | `GGML_RDMA_NO_SELECTIVE_SIGNAL` | `0` | `1` で選択的シグナリングを無効化 |
 | `GGML_RDMA_PER_DEVICE_CONN` | `0` | `1` でデバイスごとの RDMA 接続を有効化 |
 | `GGML_RDMA_PARALLEL_DISPATCH` | `1` | `0` でエキスパート並列ディスパッチを無効化 |
+| `GGML_RDMA_PIPELINE` | `0` | `1` で pipeline dispatch を有効化 |
+| `GGML_RDMA_PARALLEL` | `0` | `1` で pipeline + per-device connections を同時有効化 |
 | `GGML_RDMA_DEBUG` | `0` | `1` でデバッグ出力を有効化 |
 
 ### 注意事項
