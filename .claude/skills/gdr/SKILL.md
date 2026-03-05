@@ -65,6 +65,7 @@ ssh 192.168.100.2 "lsmod | grep nvidia_peermem"
 | RDMA バックエンドログに `nvidia-peermem module not loaded` | サーバー側でモジュール未ロード | 2号機でも `modprobe` 実行 |
 | `ibv_reg_mr` 失敗 (GPU アドレス) | peermem 未ロード or ドライバ不整合 | `modinfo nvidia-peermem` でバージョンが `nvidia-smi` と一致するか確認 |
 | RDMA Write タイムアウト (大モデル) | ConnectX-4 MTT キャッシュ溢れ | `GGML_RDMA_GDR_BUDGET_GB=12` (デフォルト) で制限 |
+| GDR + parallel dispatch でクラッシュ | `conn->recv()` 中に RNIC GDR Write → サーバー GPU CUDA カーネルと競合 | sync-before-recv、または `GGML_RDMA_PARALLEL_DISPATCH=0` |
 | `modprobe nvidia-peermem` → `Unknown symbol ib_register_peer_memory_client` | MLNX_OFED カーネルモジュールが現カーネル向けにビルドされていない。inbox `ib_uverbs` には peer memory API がない | MLNX_OFED を現カーネル向けに再インストール (`mlnxofedinstall --add-kernel-support`)、または MLNX_OFED モジュールがビルドされたカーネルで起動 |
 | `modules-load.d` に設定済みだが起動後に未ロード | `systemd-modules-load` が nvidia/ib_uverbs ドライバより先に実行される | 起動後に `lsmod \| grep nvidia_peermem` で確認。未ロードなら手動で `sudo modprobe nvidia-peermem` |
 

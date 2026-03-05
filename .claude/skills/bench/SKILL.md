@@ -78,6 +78,12 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
 | `GGML_RDMA_NO_DEFERRED_COPY` | `1` で deferred copy を無効化 (`cpy_tensor` が常に false を返す) | 未設定 (有効) |
 | `GGML_RDMA_VERIFY_COPY` | `1` で deferred copy の検証モード有効化 (デバッグ用) | 未設定 |
 | `GGML_RDMA_PER_DEVICE_CONN` | `1` でデバイスごとに独立した RDMA 接続を使用 (ConnectX-6+ 向け) | 未設定 (共有接続) |
+| `GGML_RDMA_NO_SELECTIVE_SIGNAL` | `1` で Send selective signaling を無効化 | 未設定 (有効) |
+| `GGML_RDMA_PARALLEL_DISPATCH` | `0` で parallel dispatch を無効化 | 未設定 (有効) |
+| `GGML_RDMA_PARALLEL_COMPUTE` | `0` で parallel compute を無効化 | 未設定 (有効) |
+| `GGML_RDMA_NO_SERVER_PUSH` | `1` でサーバープッシュを無効化 (per-device conn 時のみ有効) | 未設定 |
+| `GGML_RDMA_PIPELINE` | `1` で pipeline dispatch を有効化 (split-level pipeline parallelism) | 未設定 (無効) |
+| `GGML_RDMA_PARALLEL` | `1` で `GGML_RDMA_PIPELINE` + `GGML_RDMA_PER_DEVICE_CONN` を同時有効化 | 未設定 (無効) |
 
 ## よくあるエラーと対処法
 
@@ -88,6 +94,10 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 \
 | `RDMA write completion timeout` | ステージングバッファの MR 情報不一致 | サーバーを再起動してバッファ再登録 |
 | `chunk recv` ログ大量出力 | 大きなテンソル (>16MB) の転送 | 正常動作。MoEモデルで頻発 |
 | `llama_params_fit` クラッシュ | スレッド安全性の問題 (修正済み) | `op_mutex_` による保護が有効か確認 |
+| 2秒スパイク (RNR NAK) | Send/Recv タイミング不一致 | `min_rnr_timer=1` 確認。HW counter: `.../hw_counters/rnr_nak_retry_err` |
+| GDR + parallel dispatch でクラッシュ | `conn->recv()` 中に RNIC GDR Write → CUDA 競合 | `GGML_RDMA_PARALLEL_DISPATCH=0` |
+| ゴミ文字出力 (`>>9-A($%,...`) | Send buffer reuse race | always-signal fix 確認 (commit `9a5a4a911`) |
+| NaN/`????` 出力 | RDMA Write staging buffer race | always-signal fix 確認 (commit `e5700e0f8`) |
 
 ## 検証方法
 
@@ -120,6 +130,31 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 LD_LIBRARY_PATH=build/bin \
   --flash-attn on --no-warmup --single-turn --simple-io --log-file /tmp/llama-cli.log
 ```
 
-- 期待値: Prompt ≈ 30.6 t/s, Generation ≈ 8.5 t/s (GDR 有効, flash attention 有効時)
+- 期待値: Prompt ≈ 24.3 t/s, Generation ≈ 8.5 t/s (GDR 有効, flash attention 有効時)
 
 A/B 性能比較には ABAB Paired Design + 対応あり t 検定を使用。詳細: `/stats` スキル参照。
+
+## ベンチマークスクリプト Tips
+
+- CSV フィールドはクォート付き: `grep '"128","0","0"'` を使う (`grep ',128,0,'` は不可)
+- avg_ts パース: `sed 's/.*,"\([0-9.]*\)","\([0-9.]*\)"$/\1/'` (末尾から2番目のフィールド)
+- `static const` 環境変数 (`GGML_RDMA_NO_SELECTIVE_SIGNAL` 等) のトグル時はサーバー再起動が必要
+- `set -e` はベンチスクリプトでサイレント失敗を引き起こす → bench コマンドには `|| true` を付ける
+- 特殊文字を含むモデルパスでは long flags を推奨: `--model`, `--repetitions`, `--n-prompt`, `--n-gen`
+- `| head` / `| tail` パイプは専用ツール強制のハードコード制限で Bash 自動承認不可。出力フィルタリングが必要な場合は Bash ツールのキャプチャ出力を確認する
+
+## RPC バックエンド使用法
+
+RPC バックエンドとの比較ベンチマーク時に使用:
+
+- `--rpc host:port1,host:port2` フラグを使用 (`-dev RPC[...]` は不可)
+- 各 `rpc-server` は 1 GPU 担当 (`CUDA_VISIBLE_DEVICES` で制限)
+
+```bash
+CUDA_VISIBLE_DEVICES=0 build/bin/rpc-server -H 0.0.0.0 -p 50052
+CUDA_VISIBLE_DEVICES=1 build/bin/rpc-server -H 0.0.0.0 -p 50053
+
+CUDA_VISIBLE_DEVICES=0 build/bin/llama-bench \
+  --rpc 192.168.100.2:50052,192.168.100.2:50053 \
+  -m model.gguf -ngl 999 -sm layer -fa 1
+```

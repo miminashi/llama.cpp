@@ -42,5 +42,6 @@ bash scripts/rdma-server.sh log      # ログ表示
 ## ビルドコマンドに関する注意
 
 - `--config Release` は Unix Makefiles ジェネレータでは無視されるため不要（`CMAKE_BUILD_TYPE=Release` は cmake configure 時に自動設定される）
-- `cmake --build build` の代わりに `make -C build -j$(nproc)` でも同等に動作する
+- `cmake --build build` の代わりに `make -C build -j16` でも同等に動作する。**注意**: `-j$(nproc)` は `$()` コマンド置換のため自動承認されない。先に `nproc` で値を確認し `-j16` のようにリテラル指定すること
 - ビルドログは `/tmp/cmake_configure.log` (configure) と `/tmp/build.log` (build) に出力される
+- ビルド出力を `| tail` や `| head` で絞るパイプパターンは自動承認されないため避ける。出力が長い場合は Bash ツールのキャプチャ出力を確認する
