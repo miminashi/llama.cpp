@@ -288,7 +288,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [WebGPU [In Progress]](docs/build.md#webgpu) | All |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
 | [RDMA](#rdma-バックエンド-マルチノード推論) | InfiniBand/RoCE + NVIDIA GPU |
-| [Hexagon [In Progress]](docs/backend/hexagon/README.md) | Snapdragon |
+| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
 
 ## RDMA バックエンド (マルチノード推論)
