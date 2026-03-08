@@ -28,6 +28,7 @@
 /.ccls-cache/
 /.direnv/
 /.envrc
+/.env
 /.idea/
 /.swiftpm
 /.vs/
