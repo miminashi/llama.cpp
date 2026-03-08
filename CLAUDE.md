@@ -31,6 +31,7 @@
 - **パイプで `head`/`tail`/`cat` を使わない**: これらは専用ツール強制のハードコード制限で Bash 自動承認不可。ビルド出力のフィルタリングが不要ならパイプなしで実行する。出力が長い場合は Bash ツールがキャプチャした出力を確認する。代替パターン: `git log | head -N` → `git log -N`、`git log | wc -l` → `git rev-list --count`、`/proc` ファイル読み取り → `Read` ツールまたは `strings`/`tr` 単体コマンド
 - **ワークツリー**: 改善策を実装する際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する。実装が完了したらワークツリー上でコミットするが、`feature/rdma-backend` へのマージは行わないこと（マージはユーザーが判断する）
 - **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/report/` に作成する
+- **`.env` ファイル**: プロジェクトルートの `.env` にシークレット (HF_TOKEN 等) を格納。`.gitignore` 済み。コミットしないこと
 - **モデルダウンロード**: `-hf` フラグによる自動ダウンロードではなく、事前に `hf download` でダウンロードし、`-m` でローカルパスを指定すること（`hf` の方が高速）。詳細は `/bench` スキル参照
 - **pip パッケージ**: pip パッケージをインストールする際は venv を使用すること。venv はプロジェクトルート配下 `/home/ubuntu/projects/llama.cpp/.venv/<名前>/` に作成する
 
