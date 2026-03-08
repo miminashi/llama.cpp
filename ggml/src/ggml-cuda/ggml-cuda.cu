@@ -26,6 +26,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -53,6 +54,7 @@
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
+#include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2265,6 +2267,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
+static __global__ void invert_permutation(const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_from_sorted, const int n) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n) {
+        ids_from_sorted[ids_dst[j]] = j;
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2322,44 +2331,39 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
-    std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
-
-    ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
-
-    std::vector<int32_t> tokens_per_expert(ne02);
-
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    ggml_cuda_pool_alloc<int32_t> ids_src1_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_from_sorted_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds_dev(ctx.pool(), ne02 + 1);
+
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = nb12 / nb11;
+
+    ggml_cuda_launch_mm_ids_helper(
+        (const int32_t *) ids->data,
+        ids_src1_dev.get(), ids_dst_dev.get(), expert_bounds_dev.get(),
+        ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<int32_t> expert_bounds_host(ne02 + 1);
+    CUDA_CHECK(cudaMemcpyAsync(expert_bounds_host.data(), expert_bounds_dev.get(),
+        (ne02 + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
-                }
-            }
-        }
+    {
+        const int n = ne_get_rows;
+        const int block_size = 256;
+        const int num_blocks = (n + block_size - 1) / block_size;
+        invert_permutation<<<num_blocks, block_size, 0, stream>>>(ids_dst_dev.get(), ids_from_sorted_dev.get(), n);
+        CUDA_CHECK(cudaGetLastError());
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    const int32_t * ids_to_sorted   = ids_src1_dev.get();
+    const int32_t * ids_from_sorted = ids_from_sorted_dev.get();
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
         ne10, nb11, nb12, nb13,
@@ -2370,7 +2374,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
-        if (tokens_per_expert[i02] == 0) {
+        const int64_t tpe = expert_bounds_host[i02 + 1] - expert_bounds_host[i02];
+        if (tpe == 0) {
             continue;
         }
 
@@ -2386,7 +2391,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src1_slice.buffer = src1->buffer;
         src1_slice.type   = type_src1_sorted;
         src1_slice.ne[0]  = ne10;
-        src1_slice.ne[1]  = tokens_per_expert[i02];
+        src1_slice.ne[1]  = tpe;
         src1_slice.ne[2]  = 1;
         src1_slice.ne[3]  = 1;
         src1_slice.nb[0]  = ts_src1_sorted;
@@ -2400,7 +2405,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.buffer = dst->buffer;
         dst_slice.type   = type_dst_sorted;
         dst_slice.ne[0]  = ne0;
-        dst_slice.ne[1]  = tokens_per_expert[i02];
+        dst_slice.ne[1]  = tpe;
         dst_slice.ne[2]  = 1;
         dst_slice.ne[3]  = 1;
         dst_slice.nb[0]  = ts_dst_sorted;
@@ -2732,6 +2737,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_LINEAR_ATTN:
             ggml_cuda_op_gated_linear_attn(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -3412,6 +3420,69 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// returns whether the write (out) nodes overwrite the read nodes in operation
+static bool ggml_cuda_check_fusion_memory_ranges(ggml_cgraph * cgraph,
+                                                 int           node_idx,
+                                                 int           node_count,
+                                                 int *         out_nodes,
+                                                 int           out_count) {
+    auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const int64_t a_start = (int64_t) a->data;
+        const int64_t a_end   = a_start + ggml_nbytes(a);
+
+        const int64_t b_start = (int64_t) b->data;
+        const int64_t b_end   = b_start + ggml_nbytes(b);
+
+        if ((b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end)) {
+            return true;
+        }
+
+        return false;
+    };
+
+    bool is_ok = true;
+    // for nrows=1, all fusion operations correctly read the src before writing dst or do it elementwise, so we should be ok
+    if (ggml_nrows(cgraph->nodes[node_idx]) == 1) {
+        return true;
+    }
+
+    for (int i = 0; i < out_count; ++i) {
+        const ggml_tensor * dst = cgraph->nodes[out_nodes[i]];
+
+        for (int j = node_idx; j < node_idx + node_count; ++j) {
+            // Loop over all srcs of all nodes in the fusion. If the src overlaps
+            // the destination and the src is not an intermediate node that's being
+            // elided, then disable fusion.
+
+            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
+
+                if (!src || src->op == GGML_OP_NONE) {
+                    continue;
+                }
+
+                if (nodes_overlap(dst, src)) {
+                    bool found = false;
+
+                    for (int k = node_idx; k < j; ++k) {
+                        if (cgraph->nodes[k] == src) {
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found) {
+                        is_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    return is_ok;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -3608,8 +3679,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 out_nodes[1] = i + ops.size() - 1;
 
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                        ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
-                                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                                    const bool mem_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2);
+                                    if (mem_ok) {
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    } else {
+                                        ggml_cuda_pool_alloc<char> logits_copy(cuda_ctx->pool(), ggml_nbytes(logits));
+                                        CUDA_CHECK(cudaMemcpyAsync(logits_copy.get(), logits->data, ggml_nbytes(logits),
+                                                                    cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                                        ggml_tensor logits_tmp = *logits;
+                                        logits_tmp.data = logits_copy.get();
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, &logits_tmp, weights, ids, clamp, scale, bias, args);
+                                    }
                                     i += ops.size() - 1;
                                     continue;
                                 }
@@ -3623,8 +3704,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                                 int out_nodes[2] = { i + 1, i + 5 };
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                        ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids)) {
-                                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids)) {
+                                    const bool mem_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2);
+                                    if (mem_ok) {
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    } else {
+                                        ggml_cuda_pool_alloc<char> logits_copy(cuda_ctx->pool(), ggml_nbytes(logits));
+                                        CUDA_CHECK(cudaMemcpyAsync(logits_copy.get(), logits->data, ggml_nbytes(logits),
+                                                                    cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                                        ggml_tensor logits_tmp = *logits;
+                                        logits_tmp.data = logits_copy.get();
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, &logits_tmp, weights, ids, clamp, scale, bias, args);
+                                    }
                                     i += ops.size() - 1;
                                     continue;
                                 }
@@ -4907,6 +4998,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
+        case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
