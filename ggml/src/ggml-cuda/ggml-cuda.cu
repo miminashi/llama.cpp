@@ -3679,9 +3679,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 out_nodes[1] = i + ops.size() - 1;
 
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                    ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2)) {
-                                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                                    const bool mem_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2);
+                                    if (mem_ok) {
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    } else {
+                                        ggml_cuda_pool_alloc<char> logits_copy(cuda_ctx->pool(), ggml_nbytes(logits));
+                                        CUDA_CHECK(cudaMemcpyAsync(logits_copy.get(), logits->data, ggml_nbytes(logits),
+                                                                    cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                                        ggml_tensor logits_tmp = *logits;
+                                        logits_tmp.data = logits_copy.get();
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, &logits_tmp, weights, ids, clamp, scale, bias, args);
+                                    }
                                     i += ops.size() - 1;
                                     continue;
                                 }
@@ -3695,9 +3704,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                                 int out_nodes[2] = { i + 1, i + 5 };
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                    ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2)) {
-                                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids)) {
+                                    const bool mem_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2);
+                                    if (mem_ok) {
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                    } else {
+                                        ggml_cuda_pool_alloc<char> logits_copy(cuda_ctx->pool(), ggml_nbytes(logits));
+                                        CUDA_CHECK(cudaMemcpyAsync(logits_copy.get(), logits->data, ggml_nbytes(logits),
+                                                                    cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                                        ggml_tensor logits_tmp = *logits;
+                                        logits_tmp.data = logits_copy.get();
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, &logits_tmp, weights, ids, clamp, scale, bias, args);
+                                    }
                                     i += ops.size() - 1;
                                     continue;
                                 }
