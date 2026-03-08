@@ -1545,8 +1545,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             return msg;
         }
-        throw std::runtime_error(std::string("Failed to parse input at pos ") + std::to_string(result.end) + ": " +
-                                 input.substr(result.end));
+        LOG_WRN("Failed to parse chat output at pos %zu, treating as raw content\n", (size_t)result.end);
+        common_chat_msg msg;
+        msg.role = "assistant";
+        msg.content = input;
+        return msg;
     }
 
     common_chat_msg msg;
