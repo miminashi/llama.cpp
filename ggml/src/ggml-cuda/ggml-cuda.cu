@@ -26,6 +26,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2265,6 +2266,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
+static __global__ void invert_permutation(const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_from_sorted, const int n) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n) {
+        ids_from_sorted[ids_dst[j]] = j;
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2322,44 +2330,39 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
-    std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
-
-    ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
-
-    std::vector<int32_t> tokens_per_expert(ne02);
-
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    ggml_cuda_pool_alloc<int32_t> ids_src1_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_from_sorted_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds_dev(ctx.pool(), ne02 + 1);
+
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = nb12 / nb11;
+
+    ggml_cuda_launch_mm_ids_helper(
+        (const int32_t *) ids->data,
+        ids_src1_dev.get(), ids_dst_dev.get(), expert_bounds_dev.get(),
+        ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<int32_t> expert_bounds_host(ne02 + 1);
+    CUDA_CHECK(cudaMemcpyAsync(expert_bounds_host.data(), expert_bounds_dev.get(),
+        (ne02 + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
-                }
-            }
-        }
+    {
+        const int n = ne_get_rows;
+        const int block_size = 256;
+        const int num_blocks = (n + block_size - 1) / block_size;
+        invert_permutation<<<num_blocks, block_size, 0, stream>>>(ids_dst_dev.get(), ids_from_sorted_dev.get(), n);
+        CUDA_CHECK(cudaGetLastError());
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    const int32_t * ids_to_sorted   = ids_src1_dev.get();
+    const int32_t * ids_from_sorted = ids_from_sorted_dev.get();
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
         ne10, nb11, nb12, nb13,
@@ -2370,7 +2373,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
-        if (tokens_per_expert[i02] == 0) {
+        const int64_t tpe = expert_bounds_host[i02 + 1] - expert_bounds_host[i02];
+        if (tpe == 0) {
             continue;
         }
 
@@ -2386,7 +2390,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src1_slice.buffer = src1->buffer;
         src1_slice.type   = type_src1_sorted;
         src1_slice.ne[0]  = ne10;
-        src1_slice.ne[1]  = tokens_per_expert[i02];
+        src1_slice.ne[1]  = tpe;
         src1_slice.ne[2]  = 1;
         src1_slice.ne[3]  = 1;
         src1_slice.nb[0]  = ts_src1_sorted;
@@ -2400,7 +2404,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.buffer = dst->buffer;
         dst_slice.type   = type_dst_sorted;
         dst_slice.ne[0]  = ne0;
-        dst_slice.ne[1]  = tokens_per_expert[i02];
+        dst_slice.ne[1]  = tpe;
         dst_slice.ne[2]  = 1;
         dst_slice.ne[3]  = 1;
         dst_slice.nb[0]  = ts_dst_sorted;
