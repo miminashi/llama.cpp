@@ -6,6 +6,70 @@ user-invocable: true
 
 # ベンチマーク実行・検証手順
 
+## モデルダウンロード
+
+`-hf` フラグによる自動ダウンロードではなく、事前に `hf download` でダウンロードすること（高速）。
+
+### セットアップ (初回のみ)
+
+```bash
+python3 -m venv /home/ubuntu/projects/llama.cpp/.venv/hf
+/home/ubuntu/projects/llama.cpp/.venv/hf/bin/pip install huggingface_hub[cli] hf_transfer
+```
+
+### ダウンロードコマンド
+
+```bash
+bash scripts/hf-download.sh download <repo_id> [ファイル名パターン]
+```
+
+### 例
+
+```bash
+bash scripts/hf-download.sh download unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf
+
+bash scripts/hf-download.sh download unsloth/GLM-4.7-GGUF --include "GLM-4.7-UD-IQ2_M-*.gguf"
+```
+
+### サブディレクトリ形式のリポジトリ
+
+大きなモデル (例: Qwen3.5-122B-A10B) では、量子化ごとにサブディレクトリに分かれている場合がある:
+```
+repo/
+  Q4_K_M/
+    model-00001-of-00005.gguf
+    model-00002-of-00005.gguf
+    ...
+  Q3_K_M/
+    ...
+```
+
+この場合は `--include` でサブディレクトリを指定する:
+```bash
+bash scripts/hf-download.sh download unsloth/Qwen3.5-122B-A10B-GGUF --include "Q4_K_M/*"
+```
+
+### キャッシュパス
+
+ダウンロードしたファイルは以下に保存される:
+```
+/home/ubuntu/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<commit_hash>/<filename>
+```
+
+サブディレクトリ形式の場合:
+```
+/home/ubuntu/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<commit_hash>/<quant>/<filename>
+```
+
+`hf download` はダウンロード完了後にファイルパスを stdout に出力するので、それを `-m` オプションに使用する。
+
+**注意**: unsloth の `UD-*` 量子化ファイル（例: `UD-Q4_K_M`）は Ollama マニフェスト経由でのみアクセス可能で、`hf download` では取得できない（404 エラー）。`hf download` を使う場合は非 UD 版（例: `Q4_K_M`）を指定すること。
+
+キャッシュ一覧確認:
+```bash
+bash scripts/hf-models.sh
+```
+
 ## llama-bench 実行 (1号機)
 
 **qwen2.5-0.5b 2GPU (CUDA0 + RDMA0)**
@@ -26,7 +90,7 @@ GGML_RDMA_SERVERS=192.168.100.2:50051 CUDA_VISIBLE_DEVICES=0 \
 
 ### マルチファイルGGUFの使用
 
-`llama-bench` は `-hf` フラグをサポートしていないため、HuggingFaceキャッシュ内のマルチファイルGGUF（gpt-oss-120bなど）を直接指定するとスプリットファイルの検出に失敗する。
+マルチファイルGGUFは `hf download` で事前ダウンロードし、キャッシュ内のファイルにシンボリックリンクを作成して使用する。`llama-bench` はスプリットファイルの検出に標準的なファイル名を必要とする。
 
 **回避策**: 標準的なファイル名でシンボリックリンクを作成する
 
@@ -55,7 +119,7 @@ llama-bench -m /tmp/gpt-oss-120b/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf \
 GGML_RDMA_SERVERS=192.168.100.2:50051 \
   LD_LIBRARY_PATH=build/bin \
   build/bin/llama-cli \
-  -hf unsloth/gpt-oss-120b-GGUF:Q4_K_M \
+  -m /tmp/gpt-oss-120b/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf \
   -dev 'CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051],RDMA2[192.168.100.2:50051],RDMA3[192.168.100.2:50051]' \
   -sm layer -ngl 999 -c 2048 -p 'こんにちは' -n 50 \
   --flash-attn on --no-warmup --single-turn --simple-io \

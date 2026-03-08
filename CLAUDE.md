@@ -12,6 +12,7 @@
 - `/stats` — A/B ベンチマーク統計手法
 - `/gdr` — GPUDirect RDMA セットアップ・トラブルシューティング
 - `/debug-rdma` — GDB デバッグ手順・コマンド一覧
+- `/models` — ダウンロード済みモデル一覧表示
 
 ## ルール
 
@@ -30,6 +31,8 @@
 - **パイプで `head`/`tail`/`cat` を使わない**: これらは専用ツール強制のハードコード制限で Bash 自動承認不可。ビルド出力のフィルタリングが不要ならパイプなしで実行する。出力が長い場合は Bash ツールがキャプチャした出力を確認する。代替パターン: `git log | head -N` → `git log -N`、`git log | wc -l` → `git rev-list --count`、`/proc` ファイル読み取り → `Read` ツールまたは `strings`/`tr` 単体コマンド
 - **ワークツリー**: 改善策を実装する際は、`feature/rdma-backend` ブランチから新しいワークツリーを作成して作業すること。ワークツリーは `/home/ubuntu/projects/llama.cpp/.worktree/` 配下に作成する。実装が完了したらワークツリー上でコミットするが、`feature/rdma-backend` へのマージは行わないこと（マージはユーザーが判断する）
 - **レポート作成**: plan mode を使用してまとまった作業を行った場合は、完了時にレポートを作成すること。フォーマットは [REPORT.md](REPORT.md) に従う。レポートは作業ワークツリーに関わらず、常に `/home/ubuntu/projects/llama.cpp/report/` に作成する
+- **モデルダウンロード**: `-hf` フラグによる自動ダウンロードではなく、事前に `hf download` でダウンロードし、`-m` でローカルパスを指定すること（`hf` の方が高速）。詳細は `/bench` スキル参照
+- **pip パッケージ**: pip パッケージをインストールする際は venv を使用すること。venv はプロジェクトルート配下 `/home/ubuntu/projects/llama.cpp/.venv/<名前>/` に作成する
 
 ## マルチセッション ワークフロー
 
@@ -207,7 +210,10 @@ Debug ビルドと gdb ヘルパーは `/debug-rdma` スキルを参照。
 > - **テスト GPU 構成**: Node 1 CUDA4-5 + Node 2 RDMA0-1 (4GPU)
 >   - `CUDA_VISIBLE_DEVICES=4,5 GGML_RDMA_SERVERS=192.168.100.2:50051`
 >   - `-dev 'CUDA0,CUDA1,RDMA0[192.168.100.2:50051],RDMA1[192.168.100.2:50051]'`
-> - **テストモデル**: `unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_M` (`-hf` フラグで指定)
+> - **テストモデル**: `unsloth/Qwen3.5-35B-A3B-GGUF` の `Qwen3.5-35B-A3B-Q4_K_M.gguf` (`hf download` で事前ダウンロード、`-m` でキャッシュパス指定)
+>   - ダウンロード: `bash scripts/hf-download.sh download unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf`
+>   - パス: `/home/ubuntu/.cache/huggingface/hub/models--unsloth--Qwen3.5-35B-A3B-GGUF/snapshots/bc014a17be43adabd7066b7a86075ff935c6a4e2/Qwen3.5-35B-A3B-Q4_K_M.gguf`
+>   - 注意: `UD-Q4_K_M` は Ollama マニフェスト経由でのみアクセス可能なため `hf download` では取得不可。`Q4_K_M`（非 UD）を使用する
 > - **参照**: [2プロセス構成レポート](report/2026-03-02_021500_dual_llama_server_setup.md)
 
 - 各ステップで `llama-bench` または `llama-cli` によるベンチマーク実行
@@ -218,6 +224,7 @@ Debug ビルドと gdb ヘルパーは `/debug-rdma` スキルを参照。
 - **最終テストには必ず GLM-4.7 (IQ2_M) を 11GPU (7C+4R) で実行すること**
 - **`-nkvo 1` を使用しないこと** — KV キャッシュが CPU に配置され、tg が -31% 劣化する。11GPU (176GB VRAM) では KV キャッシュも GPU に収まるため不要。詳細: [tg32 デグレ調査レポート](report/2026-02-21_210816_tg32_degression_investigation.md)
 - **`-fa 1` (flash attention) を推奨** — tg32 で +10% の改善効果あり
+- **`-dev` のセパレータはツールごとに異なる** — `llama-bench` は `/` 区切り、`llama-cli` は `,` 区切り。間違えると起動時にエラーになる
 
 コマンド例・11GPU テスト手順の詳細は `/bench` スキルを参照。
 A/B 性能比較には ABAB Paired Design + 対応あり t 検定を使用。詳細: `/stats` スキル参照。
